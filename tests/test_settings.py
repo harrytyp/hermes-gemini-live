@@ -26,7 +26,7 @@ def write(tmp_path, payload):
 def test_defaults_are_the_documented_ones():
     values = settings.effective()
     assert values["transcript_mode"] == "delegations"
-    assert values["delegation_target"] == "own_session"
+    assert values["delegation_target"] == "active_session"
     assert values["model"] == config.DEFAULT_MODEL
     assert values["voice"] == config.DEFAULT_VOICE
     assert values["silence_ms"] == config.DEFAULT_SILENCE_MS

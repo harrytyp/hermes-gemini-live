@@ -237,7 +237,7 @@ def transcript_mode() -> str:
 
 def delegation_target() -> str:
     """Where delegated work lands: the call's own session, or a fresh one per task."""
-    return str(_setting("delegation_target") or "own_session")
+    return str(_setting("delegation_target") or "active_session")
 
 
 def long_call() -> str:

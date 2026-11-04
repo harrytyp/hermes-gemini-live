@@ -125,7 +125,7 @@ def test_settings_route_answers_the_form_the_panel_draws(client):
     payload = api.get(f"{_PREFIX}/settings").json()
     fields = {field["name"]: field for field in payload["fields"]}
     assert fields["transcript_mode"]["choices"] == ["delegations", "utterances", "full"]
-    assert fields["delegation_target"]["choices"] == ["call_session", "own_session"]
+    assert fields["delegation_target"]["choices"] == ["active_session", "own_session", "call_session"]
     assert payload["values"]["transcript_mode"] == "delegations"
     assert payload["path"].endswith("settings.json")
 
@@ -156,7 +156,7 @@ def test_status_reports_the_policy_the_call_will_use(client):
     api.put(f"{_PREFIX}/settings", json={"transcript_mode": "utterances"})
     policy = api.get(f"{_PREFIX}/status").json()["policy"]
     assert policy["transcript_mode"] == "utterances"
-    assert policy["delegation_target"] == "own_session"
+    assert policy["delegation_target"] == "active_session"
 
 
 def test_models_route_answers_a_usable_dropdown(client):

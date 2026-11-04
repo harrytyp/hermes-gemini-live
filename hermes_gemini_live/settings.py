@@ -33,7 +33,7 @@ PLUGIN_ID = "hermes-gemini-live"
 MODEL_CHOICES = (config.DEFAULT_MODEL, config.DEFAULT_MODEL + "-extended-thinking")
 
 TRANSCRIPT_MODES = ("delegations", "utterances", "full")
-DELEGATION_TARGETS = ("call_session", "own_session")
+DELEGATION_TARGETS = ("active_session", "own_session", "call_session")
 LONG_CALL_MODES = ("keep", "auto_restart", "hang_up")
 #: Adopted from hermes-live-voice: writes and side effects run one at a time unless the
 #: operator explicitly allows overlap, because two agents editing the same repo at once is
@@ -76,13 +76,13 @@ FIELDS: tuple[Field, ...] = (
           "delegations: nur die delegierten Aufgaben; utterances: zusätzlich jede "
           "gesprochene Äußerung als Zeile; full: zusätzlich Steuerbefehle und Status.",
           choices=TRANSCRIPT_MODES),
-    Field("delegation_target", "enum", "own_session",
+    Field("delegation_target", "enum", "active_session",
           "Wohin die Arbeit geht",
-          "own_session: jede Aufgabe bekommt ihre eigene Session (Standard, weil der "
-          "api_server ein Fortsetzen in eine von Hand angelegte Session mit "
-          "permission_denied ablehnt); call_session: es wird versucht, die Arbeit in die "
-          "Session des Anrufs zu legen — lehnt der Server ab, läuft die Aufgabe in ihrer "
-          "eigenen Session weiter statt zu scheitern.",
+          "active_session: der Anruf hängt sich an den gerade offenen Chat — dieselbe "
+          "Historie, dieselbe Memory, Text und Stimme abwechselnd (so macht es auch die "
+          "eingebaute Sprachfunktion); own_session: jede Aufgabe bekommt ihre eigene "
+          "Session; call_session: die Arbeit landet im Protokoll des Anrufs, das der erste "
+          "Lauf anlegt.",
           choices=DELEGATION_TARGETS),
     Field("include_voice_context", "bool", True,
           "Gesprochenen Kontext mitgeben",

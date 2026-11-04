@@ -72,8 +72,8 @@ def test_a_conflict_is_not_silently_swallowed(monkeypatch):
 
 
 def test_the_default_target_is_the_one_that_works_out_of_the_box():
-    assert settings.BY_NAME["delegation_target"].default == "own_session"
-    assert config.delegation_target() == "own_session"
+    assert settings.BY_NAME["delegation_target"].default == "active_session"
+    assert config.delegation_target() == "active_session"
 
 
 # ── call_session: adopt the run's own session (root cause, not a workaround) ─────────

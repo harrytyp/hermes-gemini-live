@@ -5,7 +5,7 @@
 //
 // Audio leaves this window as 16 kHz s16le frames over a sibling WebSocket; the Gemini
 // key is never sent here and never read here. The relay owns it.
-import { icons, resolveSiblingWsUrl } from '@hermes/plugin-sdk'
+import { host, icons, resolveSiblingWsUrl } from '@hermes/plugin-sdk'
 import { createElement as h, useEffect, useState } from 'react'
 
 const RELAY_PATH = '/api/plugins/hermes-gemini-live/relay'
@@ -320,6 +320,8 @@ function tearDown (note) {
     call.stopCapture = null
   }
   call.player?.flush()
+  // Hand the microphone back to whatever was listening before this call started.
+  resumeWakeWord()
   call.state = 'idle'
   call.level = 0
   call.speaking = false
@@ -395,6 +397,8 @@ function receive (event) {
     // The user's own words are the only honest start of a "thinking" window: an
     // extended-thinking model is silent while it works, and silence alone reads dead.
     call.lastInText = Date.now()
+  } else if (frame.type === 'delegate') {
+    void delegateIntoSession(frame)
   } else if (frame.type === 'call_session') {
     // The relay minted (or reused) the session this call writes into. Kept for the panel
     // so "where did that call go" has an answer without opening the sidebar.
@@ -478,6 +482,106 @@ async function relayUrl () {
   return resolveSiblingWsUrl({}, RELAY_PATH)
 }
 
+/* ─────────────────── delegating into the chat that is open ───────────────────
+ * The Python half cannot address a chat the api_server did not create (it refuses the
+ * resume). The renderer can: `session.activate` + `prompt.submit` is the very door the
+ * built-in voice lane uses, with `surface: 'voice-live'` and the spoken window riding
+ * `voice_context` — persisted turn fields, not cosmetics. The answer comes back through
+ * the ordinary transcript: poll the session's newest rows until an assistant message
+ * appears that was not there before the submit.
+ */
+/* Hermes ships its own wake word ("hey hermes", openwakeword) whose listener holds the
+ * microphone. Core's voice lane stops it before opening a call for exactly that reason;
+ * this plugin has to do the same or the two fight over the device. Only RPCs core already
+ * exposes are used, and every call is best-effort: a host without wake.* is simply left
+ * alone. What a plugin cannot do is *be* the wake target — that routing lives in core.
+ */
+async function pauseWakeWord () {
+  if (!host || typeof host.request !== 'function') return false
+  try {
+    const status = await host.request('wake.status', {})
+    call.wakeWasListening = Boolean(status && (status.listening || status.enabled))
+    if (status && status.owner === false) return false
+    if (status && status.listening === false) return false
+    await host.request('wake.stop', {})
+    return true
+  } catch {
+    return false
+  }
+}
+
+function resumeWakeWord () {
+  if (!call.wakeWasListening || !host || typeof host.request !== 'function') return
+  call.wakeWasListening = false
+  void host.request('wake.start', {}).catch(() => undefined)
+}
+
+const DELEGATION_TIMEOUT_MS = 180000
+const DELEGATION_POLL_MS = 1500
+
+async function readMessages (sessionId) {
+  const api = globalThis.hermesDesktop && globalThis.hermesDesktop.api
+  if (typeof api !== 'function') return null
+  const result = await api({
+    path: '/api/sessions/' + encodeURIComponent(sessionId) +
+      '/messages?limit=6&order=latest&include_compacted=true'
+  })
+  if (!result || typeof result !== 'object') return null
+  if (Array.isArray(result.messages)) return result.messages
+  if (Array.isArray(result.data)) return result.data
+  return null
+}
+
+function lastAssistantText (rows) {
+  if (!Array.isArray(rows)) return ''
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index] || {}
+    const content = typeof row.content === 'string' ? row.content : ''
+    if (row.role === 'assistant' && content.trim()) return content.trim()
+  }
+  return ''
+}
+
+async function delegateIntoSession (frame) {
+  const ws = call.socket
+  const send = payload => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload))
+  }
+  const report = (state, text) => send({ type: 'delegate_result', id: frame.id, state, text })
+  const sessionId = call.delegateSession
+  if (!sessionId) { report('failed', 'Kein offener Chat — bitte zuerst eine Session öffnen.'); return }
+  if (!host || typeof host.request !== 'function') {
+    report('failed', 'Dieser Host kann keine Befehle an Hermes senden.')
+    return
+  }
+  let before = ''
+  try { before = lastAssistantText(await readMessages(sessionId)) } catch { /* optional */ }
+  try {
+    await host.request('session.activate', { session_id: sessionId })
+    await host.request('prompt.submit', {
+      session_id: sessionId,
+      text: frame.prompt,
+      submission_id: 'gml-' + frame.id + '-' + Date.now(),
+      surface: 'voice-live',
+      voice_turn: true,
+      ...(frame.context ? { voice_context: String(frame.context).slice(0, 6000) } : {})
+    })
+  } catch (error) {
+    report('failed', 'Hermes nahm den Auftrag nicht an: ' + message(error))
+    return
+  }
+  const deadline = Date.now() + DELEGATION_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, DELEGATION_POLL_MS))
+    if (call.socket !== ws) return
+    let rows = null
+    try { rows = await readMessages(sessionId) } catch { continue }
+    const answer = lastAssistantText(rows)
+    if (answer && answer !== before) { report('completed', answer.slice(0, 4000)); return }
+  }
+  report('unknown', 'Ich konnte die Antwort nicht abholen — sie steht in der Session.')
+}
+
 async function start (rest) {
   if (call.state !== 'idle') return
   call.state = 'connecting'
@@ -490,6 +594,12 @@ async function start (rest) {
   call.lastInText = 0
   call.taskAt = 0
   call.startedAt = Date.now()
+  // Captured now, not at delegation time: navigating during a call must not silently
+  // move the next task into whatever chat happens to be open by then.
+  call.delegateSession = host && host.state && host.state.activeSessionId
+    ? host.state.activeSessionId.get()
+    : null
+  void pauseWakeWord()
   beginMeter()
   publish()
   void loadStatus(rest)
@@ -512,6 +622,11 @@ async function start (rest) {
   call.socket = ws
   ws.onopen = async () => {
     call.state = 'live'
+    // The relay writes the transcript itself (append-only rows); naming the chat here is
+    // what makes the spoken turns land in the conversation the user is actually in.
+    if (call.delegateSession) {
+      try { ws.send(JSON.stringify({ type: 'session', id: call.delegateSession })) } catch { /* socket raced */ }
+    }
     publish()
     try {
       call.stopCapture = await startCapture(appendChunk, call.tuning)

@@ -122,6 +122,8 @@ async def test_mic_and_type_frames_reach_the_live_socket(opened):
 
 @pytest.mark.asyncio
 async def test_live_events_are_relabelled_for_the_renderer(opened, monkeypatch):
+    # This file tests the api_server lane; the renderer lane has its own tests.
+    monkeypatch.setattr(relay.config, "delegation_target", lambda: "own_session")
     # This test is about labelling, so the run itself must not reach the network.
     monkeypatch.setattr(relay.agent_lane, "start_task", lambda *a, **k: "task-x")
     live = opened(FakeLive(incoming=[{"setupComplete": {}},
@@ -189,6 +191,7 @@ async def test_a_server_goodbye_ends_the_call_as_its_own_reason(opened):
 
 @pytest.mark.asyncio
 async def test_a_tool_call_answers_with_a_receipt_and_starts_no_wait(opened, monkeypatch):
+    monkeypatch.setattr(relay.config, "delegation_target", lambda: "own_session")
     started: list[tuple[str, object]] = []
 
     def fake_start_task(prompt, on_finished, session_key=None, book=None, profile=None,

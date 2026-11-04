@@ -167,6 +167,12 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
                 await asyncio.to_thread(
                     ctx.note, f"Nutzer-Entscheidung zu Aufgabe #{value.get('id')}: {value.get('choice')}")
             await _user_approval(value, live, browser, book, session_key, profile)
+        elif kind == "session" and ctx is not None:
+            sid = str(_loads(message).get("id") or "").strip()
+            if sid and ctx.log.adopt(sid):
+                logger.info("hermes-gemini-live: transcript follows the open session %s", sid)
+        elif kind == "delegate_result" and ctx is not None:
+            await _delegate_finished(_loads(message), browser, book, notes)
         elif kind == "close":
             note["reason"] = "browser closed the call"
             return
@@ -213,6 +219,20 @@ async def _handle_tool_call(call: dict, live: LiveSession, browser: Any,
                                    "prompt": str(args.get("task") or "").strip()[:200]}))
     await asyncio.to_thread(
         ctx.note, f"Aufgabe #{call_id} gestartet: {str(args.get('task') or '').strip()[:400]}")
+    if ctx.target == "active_session":
+        # The renderer owns this one: it submits into the chat that is open, exactly the way
+        # the built-in voice lane does (session.activate + prompt.submit), and reports back
+        # with a ``delegate_result`` frame. Nothing here touches the api_server, so the
+        # admission rule that refuses hand-made sessions never applies.
+        book.register(call_id, str(args.get("task") or ""))
+        book.set_state(call_id, "running")
+        await browser.send_text(_dump({
+            "type": "delegate",
+            "id": call_id,
+            "prompt": str(args.get("task") or "").strip(),
+            "context": ctx.transcript.context() if ctx.include_context else "",
+        }))
+        return
     agent_lane.start_task(
         ctx.prompt_with_context(task),
         on_finished=_make_finisher(notes, browser, loop),
@@ -328,6 +348,18 @@ def _adopt_run_session(ctx: CallContext, run_id: str, browser: Any,
         await browser.send_text(_dump({"type": "call_session", "id": session_id}))
 
     _hand_off(announce(), loop, "session", "adopted")
+
+
+async def _delegate_finished(value: dict, browser: Any, book: agent_lane.RunBook,
+                            notes: NoteQueue) -> None:
+    """The renderer finished (or gave up on) a task it submitted into the open chat."""
+    task_id = str(value.get("id") or "").strip()
+    state = str(value.get("state") or "unknown").strip() or "unknown"
+    text = str(value.get("text") or "").strip()
+    book.set_state(task_id, state, result=text)
+    notes.push(RESULT_NOTE.format(task_id=task_id, state=state, text=text or "no output"))
+    await browser.send_text(_dump({"type": "task_done", "id": task_id, "state": state}))
+    await _release(notes, task_id, "finished")
 
 
 def _hand_off(coro, loop: asyncio.AbstractEventLoop, task_id: str, why: str) -> None:
@@ -481,7 +513,12 @@ def _frame_type(message: str) -> str:
     if kind == "approval" and not (str(value.get("id") or "").strip()
                                    and value.get("choice") in ("approve", "deny")):
         return ""
-    return kind if kind in ("audio", "text", "approval", "close") else ""
+    if kind == "delegate_result" and not (str(value.get("id") or "").strip()):
+        return ""
+    if kind == "session" and not str(value.get("id") or "").strip():
+        return ""
+    return kind if kind in ("audio", "text", "approval", "close", "delegate_result",
+                            "session") else ""
 
 
 def _b64(message: str) -> str:
@@ -538,7 +575,7 @@ async def _run_relay(browser: Any, session_key: str | None = None,
     # ``call_session`` waits for the run to hand us its session (see _adopt_run_session);
     # only a recording mode that is not adopting needs one up front.
     ctx.adopt_first = target == "call_session"
-    mint_here = session_log.wanted(mode) and not ctx.adopt_first
+    mint_here = session_log.wanted(mode) and not ctx.adopt_first and target != "active_session"
     if mint_here and agent_lane.key():
         ctx.log = await asyncio.to_thread(session_log.CallLog.create, profile, session_key)
         if ctx.log.session_id:
