@@ -262,6 +262,12 @@ def concurrency() -> str:
     return str(_setting("concurrency") or "exclusive")
 
 
+def take_over_button() -> bool:
+    """Whether core's own voice control is hidden while this plugin provides the voice."""
+    stored = _setting("take_over_button")
+    return False if stored is None else bool(stored)
+
+
 def wake_provider() -> str:
     """Which engine to ask for: ``auto`` means "whatever Hermes ships and is present"."""
     stored = _setting("wake_provider")

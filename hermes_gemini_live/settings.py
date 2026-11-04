@@ -139,6 +139,9 @@ FIELDS: tuple[Field, ...] = (
     Field("half_duplex", "bool", False, "Halbduplex",
           "Mikrofon stumm, während die Gegenseite spricht; für offene Lautsprecher.",
           env=config.ENV_PREFIX + "HALF_DUPLEX"),
+    Field("take_over_button", "bool", False, "Nur ein Sprachknopf",
+          "Blendet Hermes' eigenen Sprachknopf im Composer aus, solange dieses Plugin telefoniert.",
+          env=config.ENV_PREFIX + "TAKE_OVER_BUTTON"),
     Field("wake_provider", "enum", "auto", "Wake-Engine",
           "Hermes liefert sherpa und porcupine mit; auto nimmt davon die vorhandene. "
           "openwakeword nur, wenn es zusätzlich installiert wurde.",

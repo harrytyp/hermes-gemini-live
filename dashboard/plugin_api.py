@@ -107,7 +107,8 @@ async def status(profile: str = "") -> dict:
         payload["wake"] = {"armed": False, "reason": f"{type(exc).__name__}: {exc}",
                            "pending": 0.0, "core": {}}
     try:
-        payload["policy"] = {"wake_word": config.wake_word(),
+        payload["policy"] = {"take_over_button": config.take_over_button(),
+                             "wake_word": config.wake_word(),
                              "transcript_mode": config.transcript_mode(),
                              "delegation_target": config.delegation_target(),
                              "long_call": config.long_call(),

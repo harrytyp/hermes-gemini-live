@@ -350,6 +350,7 @@ async function loadStatus (rest) {
     call.status = { ok: false, detail: 'backend: ' + message(error) }
   }
   const policy = (call.status && call.status.policy) || {}
+  applyCoreVoiceVisibility(Boolean(policy.take_over_button))
   const devices = (call.status && call.status.devices) || {}
   call.tuning = {
     ...DEFAULT_TUNING,
@@ -515,6 +516,33 @@ function resumeWakeWord () {
   if (!call.wakeWasListening || !host || typeof host.request !== 'function') return
   call.wakeWasListening = false
   void host.request('wake.start', {}).catch(() => undefined)
+}
+
+/* One voice button, not two. Core's composer control is not addressable from a plugin —
+ * it is core chrome — but it IS in this document, so hiding it is a style rule, and the
+ * rules match the localized labels the control carries. Best effort by construction: a
+ * label this list does not know (another locale, a renamed control) simply leaves the
+ * button in place, which degrades to "two buttons" and never to "no way to start voice".
+ */
+const CORE_VOICE_LABELS = [
+  'Start voice conversation', 'Voice conversation', 'Voice',
+  'Sprachkonversation starten', 'Sprachunterhaltung', 'Sprache'
+]
+const HIDE_CORE_VOICE_ID = 'hermes-gemini-live-hide-core-voice'
+
+function applyCoreVoiceVisibility (hide) {
+  const existing = document.getElementById(HIDE_CORE_VOICE_ID)
+  if (!hide) {
+    if (existing) existing.remove()
+    return
+  }
+  if (existing) return
+  const style = document.createElement('style')
+  style.id = HIDE_CORE_VOICE_ID
+  style.textContent = CORE_VOICE_LABELS
+    .map(label => '[aria-label="' + label + '"]:not([data-gml-own])')
+    .join(',\n') + ' { display: none !important; }'
+  document.head.appendChild(style)
 }
 
 /* "Hey Hermes" for this lane. The detection runs in the plugin's own process (it takes
@@ -714,6 +742,7 @@ function TalkControl ({ rest }) {
   if (call.state === 'idle') {
     return h('button', {
       type: 'button',
+      'data-gml-own': '1',
       title: wakeNotice || call.detail || (blocked && status ? status.detail : 'Start a Gemini Live call'),
       'aria-label': 'Start Gemini Live call',
       disabled: blocked,
