@@ -94,8 +94,9 @@ def opened(monkeypatch):
 
         class Stub:
             @staticmethod
-            async def open(tools=None):
+            async def open(tools=None, handle=None):
                 seen["tools"] = tools
+                seen["handle"] = handle
                 return live
 
         monkeypatch.setattr(relay, "LiveSession", Stub)
@@ -165,7 +166,7 @@ async def test_a_refused_open_reports_why_and_leaves_no_session(monkeypatch):
 
     class Refusing:
         @staticmethod
-        async def open(tools=None):
+        async def open(tools=None, handle=None):
             raise ConfigError("no Gemini key for Live: set GEMINI_LIVE_API_KEY or GEMINI_API_KEY")
 
     monkeypatch.setattr(relay, "LiveSession", Refusing)
@@ -191,7 +192,7 @@ async def test_a_tool_call_answers_with_a_receipt_and_starts_no_wait(opened, mon
     started: list[tuple[str, object]] = []
 
     def fake_start_task(prompt, on_finished, session_key=None, book=None, profile=None,
-                        task_id=None, on_needs_input=None):
+                        task_id=None, on_needs_input=None, session_id=None, on_run=None):
         started.append((prompt, on_finished, profile, task_id, on_needs_input))
         return "task-1"
 

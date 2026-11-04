@@ -59,34 +59,76 @@ class LiveSession:
         self.closed_reason = ""
 
     @classmethod
-    async def open(cls, tools: list[dict] | None = None) -> "LiveSession":
+    async def open(cls, tools: list[dict] | None = None,
+                   handle: str | None = None) -> "LiveSession":
+        """Open one session, with two adopted retries around the original single attempt.
+
+        From gemini-live-bridge: a rejected resume handle is not a dead call — retry the
+        same model fresh once — and a model that refuses the setup is not a dead call
+        either when another Live model is available. Both retries are bounded, and both
+        are visible in the log, because silently switching the voice model mid-dial would
+        be worse than the failure it hides.
+        """
         try:
             key = config.resolve_key()
             model = config.model()
-            plan = {
-                "model": model,
+            base = {
                 "voice": config.voice(),
                 "instructions": config.instructions(),
-                "thinking_level": config.thinking_level(model),
                 "activity": config.activity_detection(),
                 "tools": tools,
             }
         except config.ConfigError as exc:
             raise LiveError(str(exc)) from exc
+        candidates = [model]
+        if config.model_fallback():
+            try:
+                from . import models
+                candidates += [name for name in models.catalog()[:4] if name != model]
+            except Exception:
+                pass  # the chosen model alone is still a valid attempt
+        last: LiveError | None = None
+        for candidate in candidates:
+            plan = {**base, "model": candidate,
+                    "thinking_level": config.thinking_level(candidate)}
+            attempts = (handle, None) if handle else (None,)
+            for resume in attempts:
+                if resume is not None:
+                    plan["resume_handle"] = resume
+                else:
+                    plan.pop("resume_handle", None)
+                try:
+                    return await cls._connect(key, plan, resume)
+                except LiveError as exc:
+                    last = exc
+                    if resume is not None:
+                        logger.info("hermes-gemini-live: resume handle refused (%s); "
+                                    "retrying %s with a fresh session", exc, candidate)
+                        continue
+                    if len(candidates) > 1:
+                        logger.info("hermes-gemini-live: %s refused the setup (%s); trying "
+                                    "the next model", candidate, exc)
+                    break
+        raise last or LiveError("no Live model could be opened")
+
+    @classmethod
+    async def _connect(cls, key: str, plan: dict, handle: str | None) -> "LiveSession":
+        """The single-socket path: connect, send setup, wait for setupComplete."""
         try:
             socket = await websockets.connect(uri_with(key), max_size=None,
                                               open_timeout=OPEN_TIMEOUT_S)
         except Exception as exc:
             raise LiveError(_redactor(key)(f"{type(exc).__name__}: {exc}")) from exc
-        session = cls(socket, key, model)
+        session = cls(socket, key, plan["model"])
         try:
             await session._send(wire.build_setup(**plan))
             await session._await_setup()
         except BaseException:
             await session.close()
             raise
-        logger.info("hermes-gemini-live: Live session open (%s, silence=%dms)",
-                    model, plan["activity"]["automaticActivityDetection"]["silenceDurationMs"])
+        logger.info("hermes-gemini-live: Live session open (%s%s, silence=%dms)",
+                    plan["model"], " resuming" if handle else "",
+                    plan["activity"]["automaticActivityDetection"]["silenceDurationMs"])
         return session
 
     async def _await_setup(self) -> None:

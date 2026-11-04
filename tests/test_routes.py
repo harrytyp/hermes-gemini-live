@@ -118,3 +118,65 @@ def test_authorize_gate_refuses_when_the_gate_itself_raises(client, monkeypatch)
 
     monkeypatch.setattr(module.importlib, "import_module", lambda name: Exploding())
     assert module._upgrade_authorized(object()) is False
+
+
+def test_settings_route_answers_the_form_the_panel_draws(client):
+    api, _module = client
+    payload = api.get(f"{_PREFIX}/settings").json()
+    fields = {field["name"]: field for field in payload["fields"]}
+    assert fields["transcript_mode"]["choices"] == ["delegations", "utterances", "full"]
+    assert fields["delegation_target"]["choices"] == ["call_session", "own_session"]
+    assert payload["values"]["transcript_mode"] == "delegations"
+    assert payload["path"].endswith("settings.json")
+
+
+def test_saving_settings_is_visible_on_the_next_read(client, tmp_path):
+    api, _module = client
+    response = api.put(f"{_PREFIX}/settings",
+                       json={"transcript_mode": "full", "voice": "Kore", "silence_ms": 900})
+    assert response.status_code == 200
+    assert response.json()["values"]["transcript_mode"] == "full"
+    again = api.get(f"{_PREFIX}/settings").json()
+    assert again["values"]["voice"] == "Kore"
+    assert again["values"]["silence_ms"] == 900
+    assert (tmp_path / "plugin-data" / "hermes-gemini-live" / "settings.json").is_file()
+
+
+def test_a_refused_value_is_a_400_and_changes_nothing(client):
+    api, _module = client
+    api.put(f"{_PREFIX}/settings", json={"long_call": "hang_up"})
+    response = api.put(f"{_PREFIX}/settings", json={"long_call": "explode"})
+    assert response.status_code == 400
+    assert "long_call" in response.json()["detail"] or "Wenn die Session" in response.json()["detail"]
+    assert api.get(f"{_PREFIX}/settings").json()["values"]["long_call"] == "hang_up"
+
+
+def test_status_reports_the_policy_the_call_will_use(client):
+    api, _module = client
+    api.put(f"{_PREFIX}/settings", json={"transcript_mode": "utterances"})
+    policy = api.get(f"{_PREFIX}/status").json()["policy"]
+    assert policy["transcript_mode"] == "utterances"
+    assert policy["delegation_target"] == "own_session"
+
+
+def test_models_route_answers_a_usable_dropdown(client):
+    api, _module = client
+    payload = api.get(f"{_PREFIX}/models").json()
+    # Without a reachable Google endpoint the proven pair is the honest answer.
+    assert payload["models"]
+    assert payload["default"] in payload["models"]
+
+
+def test_usage_route_is_numeric_only(client):
+    api, _module = client
+    payload = api.get(f"{_PREFIX}/usage").json()
+    assert payload["all_time"]["calls"] == 0
+    assert payload["price_date"]
+    assert set(payload) == {"last_24h", "all_time", "recent", "price_date", "price_url"}
+
+
+def test_status_reports_the_devices_the_renderer_must_use(client):
+    api, _module = client
+    api.put(f"{_PREFIX}/settings", json={"input_device": "mic-1", "output_device": "spk-2"})
+    devices = api.get(f"{_PREFIX}/status").json()["devices"]
+    assert devices == {"input": "mic-1", "output": "spk-2"}

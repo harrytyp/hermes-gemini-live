@@ -89,11 +89,31 @@ def resolve_key() -> str:
     raise ConfigError("no Gemini key for Live: set GEMINI_LIVE_API_KEY or GEMINI_API_KEY")
 
 
+def _setting(name: str):
+    """A panel setting, or None when the panel has never spoken.
+
+    Imported late: ``settings`` reads this module for its schema, so a module-level
+    import would be a cycle. A settings failure must never take the lane down, so any
+    exception degrades to "not stored" and the env/default path answers.
+    """
+    try:
+        from . import settings
+        return settings.value(name)
+    except Exception:
+        return None
+
+
 def model() -> str:
+    stored = _setting("model")
+    if stored:
+        return str(stored)
     return (os.environ.get(ENV_PREFIX + "MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
 def voice() -> str:
+    stored = _setting("voice")
+    if stored:
+        return str(stored)
     raw = (os.environ.get(ENV_PREFIX + "VOICE") or DEFAULT_VOICE).strip() or DEFAULT_VOICE
     if raw not in LIVE_VOICES:
         raise ConfigError(
@@ -118,10 +138,16 @@ def _ms(name: str, default: int, bounds: tuple[int, int]) -> int:
 
 
 def silence_ms() -> int:
+    stored = _setting("silence_ms")
+    if isinstance(stored, int):
+        return stored
     return _ms(ENV_PREFIX + "SILENCE_MS", DEFAULT_SILENCE_MS, SILENCE_MS_RANGE)
 
 
 def prefix_ms() -> int:
+    stored = _setting("prefix_ms")
+    if isinstance(stored, int):
+        return stored
     return _ms(ENV_PREFIX + "PREFIX_MS", DEFAULT_PREFIX_MS, PREFIX_MS_RANGE)
 
 
@@ -148,6 +174,13 @@ def _flag(name: str, default: bool) -> bool:
     raise ConfigError(f"{name} '{raw}' is not a boolean")
 
 
+def _tuned(name: str, default: bool) -> bool:
+    stored = _setting(name)
+    if isinstance(stored, bool):
+        return stored
+    return _flag(ENV_PREFIX + name.upper(), default)
+
+
 def audio_tuning() -> dict:
     """Capture rules the renderer must apply, shipped from here so one profile can
     change them without touching the plugin bundle.
@@ -159,10 +192,10 @@ def audio_tuning() -> dict:
     model speaks, which costs talk-over interruption and buys back a call that finishes.
     """
     return {
-        "echoCancellation": _flag(ENV_PREFIX + "ECHO_CANCELLATION", True),
-        "noiseSuppression": _flag(ENV_PREFIX + "NOISE_SUPPRESSION", True),
-        "autoGainControl": _flag(ENV_PREFIX + "AUTO_GAIN", True),
-        "halfDuplex": _flag(ENV_PREFIX + "HALF_DUPLEX", False),
+        "echoCancellation": _tuned("echo_cancellation", True),
+        "noiseSuppression": _tuned("noise_suppression", True),
+        "autoGainControl": _tuned("auto_gain", True),
+        "halfDuplex": _tuned("half_duplex", False),
     }
 
 
@@ -179,6 +212,9 @@ def thinking_level(model_id: str) -> str | None:
     """
     if "extended-thinking" not in model_id:
         return None
+    stored = _setting("thinking_level")
+    if stored:
+        return str(stored)
     raw = (os.environ.get(ENV_PREFIX + "THINKING_LEVEL") or DEFAULT_THINKING_LEVEL).strip().lower()
     if raw not in THINKING_LEVELS:
         raise ConfigError(
@@ -189,8 +225,51 @@ def thinking_level(model_id: str) -> str | None:
 
 
 def instructions() -> str:
-    extra = (os.environ.get(ENV_PREFIX + "INSTRUCTIONS") or "").strip()
+    extra = str(_setting("extra_instructions") or "").strip() or \
+        (os.environ.get(ENV_PREFIX + "INSTRUCTIONS") or "").strip()
     return f"{DEFAULT_INSTRUCTIONS} {extra}".strip() if extra else DEFAULT_INSTRUCTIONS
+
+
+def transcript_mode() -> str:
+    """How much of the call is written into the session: delegations | utterances | full."""
+    return str(_setting("transcript_mode") or "delegations")
+
+
+def delegation_target() -> str:
+    """Where delegated work lands: the call's own session, or a fresh one per task."""
+    return str(_setting("delegation_target") or "own_session")
+
+
+def long_call() -> str:
+    """What to do when the Live session reports it is running out: keep | auto_restart | hang_up."""
+    return str(_setting("long_call") or "auto_restart")
+
+
+def include_voice_context() -> bool:
+    """Whether a delegated task carries the recent spoken exchange with it."""
+    stored = _setting("include_voice_context")
+    return True if stored is None else bool(stored)
+
+
+def model_fallback() -> bool:
+    """Whether a failed session setup may try the next model instead of ending the call."""
+    stored = _setting("model_fallback")
+    return True if stored is None else bool(stored)
+
+
+def concurrency() -> str:
+    """How many delegated tasks may run at once: exclusive (one) or parallel (four)."""
+    return str(_setting("concurrency") or "exclusive")
+
+
+def input_device() -> str:
+    """Preferred microphone device id, or '' for the system default."""
+    return str(_setting("input_device") or "")
+
+
+def output_device() -> str:
+    """Preferred speaker device id, or '' for the system default."""
+    return str(_setting("output_device") or "")
 
 
 def api_server_session_key() -> str | None:

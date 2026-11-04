@@ -91,7 +91,10 @@ async function startCapture (onChunk, tuning) {
     audio: {
       autoGainControl: tuning.autoGainControl,
       echoCancellation: tuning.echoCancellation,
-      noiseSuppression: tuning.noiseSuppression
+      noiseSuppression: tuning.noiseSuppression,
+      // An empty id means "whatever the system picked"; an exact id is what makes the
+      // headset in the drawer actually get used.
+      ...(tuning.inputDevice ? { deviceId: { exact: tuning.inputDevice } } : {})
     }
   })
   const context = new AudioContext()
@@ -154,11 +157,41 @@ function createPlayer () {
   const live = new Set()
 
   return {
+    /** Route playback to one output device. Chromium-only; a refusal is reported, not fatal. */
+    async setSink (id) {
+      if (!id) return ''
+      if (typeof context.setSinkId !== 'function') return 'Dieser Host kann kein Ausgabegerät wählen.'
+      try {
+        await context.setSinkId(id)
+        return ''
+      } catch {
+        return 'Das Ausgabegerät ist nicht verfügbar.'
+      }
+    },
+    /** True while scheduled audio is still queued — a far better half-duplex signal than
+     *  "the last frame arrived N ms ago", which goes false the moment the model pauses. */
+    speaking () {
+      return live.size > 0 || next - context.currentTime > 0.05
+    },
     play (bytes) {
       const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1)
       const buffer = context.createBuffer(1, samples.length, 24000)
       const channel = buffer.getChannelData(0)
       for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32767
+      // Backpressure guard (dandacompany): if the queue is more than 15 s ahead of the
+      // clock the stream has run away, and playing it out would put the voice minutes
+      // behind the conversation. Drop the backlog and resynchronise instead.
+      if (next - context.currentTime > 15) {
+        live.forEach((queued) => {
+          try {
+            queued.stop()
+          } catch {
+            /* already finished */
+          }
+        })
+        live.clear()
+        next = context.currentTime
+      }
       const node = context.createBufferSource()
       node.buffer = buffer
       node.connect(gain)
@@ -314,7 +347,13 @@ async function loadStatus (rest) {
     // plugin disabled, which is a different fix from a missing key.
     call.status = { ok: false, detail: 'backend: ' + message(error) }
   }
-  call.tuning = { ...DEFAULT_TUNING, ...((call.status && call.status.audio) || {}) }
+  const devices = (call.status && call.status.devices) || {}
+  call.tuning = {
+    ...DEFAULT_TUNING,
+    ...((call.status && call.status.audio) || {}),
+    inputDevice: devices.input || '',
+    outputDevice: devices.output || ''
+  }
   publish()
 }
 
@@ -328,7 +367,12 @@ function appendChunk (bytes, peak) {
   // Half-duplex: when a loudspeaker beats the canceller, the model's own reply arrives
   // at the mic and Live reads it as a listener interrupting. Muting the uplink while it
   // speaks costs talk-over interruption and buys back a call that actually finishes.
-  if (tuning.halfDuplex && Date.now() - call.lastAudio < 600) return
+  // Half-duplex asks "is audio actually still queued?", not "did a frame arrive lately":
+  // a model that pauses mid-sentence would otherwise un-mute the mic into its own tail.
+  const speakingNow = call.player && typeof call.player.speaking === 'function'
+    ? call.player.speaking()
+    : Date.now() - call.lastAudio < 600
+  if (tuning.halfDuplex && speakingNow) return
   const ws = call.socket
   if (!ws || ws.readyState !== WebSocket.OPEN) return
   ws.send(JSON.stringify({ type: 'audio', data: toBase64(bytes) }))
@@ -351,6 +395,11 @@ function receive (event) {
     // The user's own words are the only honest start of a "thinking" window: an
     // extended-thinking model is silent while it works, and silence alone reads dead.
     call.lastInText = Date.now()
+  } else if (frame.type === 'call_session') {
+    // The relay minted (or reused) the session this call writes into. Kept for the panel
+    // so "where did that call go" has an answer without opening the sidebar.
+    call.sessionId = frame.id
+    publish()
   } else if (frame.type === 'task_started') {
     if (!call.taskAt) call.taskAt = Date.now()
     if (!call.pending.includes(frame.id)) call.pending = [...call.pending, frame.id]
@@ -403,6 +452,32 @@ function answerApproval (choice) {
   ws.send(JSON.stringify({ type: 'approval', id, choice }))
 }
 
+/**
+ * The relay socket URL. A Desktop in native-auth mode mints plugin sockets through its own
+ * bridge, and the upgrade then carries a reserved grant header — the only credential a
+ * renderer can present on an /api/plugins path. resolveSiblingWsUrl alone swaps the path on a
+ * /api/ws ticket, which this host answers with 403 ("the relay socket failed"). Token-mode and
+ * dashboard hosts keep the sibling mint, which carries ?token=.
+ */
+async function relayUrl () {
+  const bridge = globalThis.hermesDesktop
+  if (bridge && typeof bridge.getPluginWsUrl === 'function') {
+    try {
+      const connection = typeof bridge.getConnection === 'function' ? await bridge.getConnection() : null
+      if (!connection || connection.authMode === 'native' || !connection.authMode) {
+        const minted = await bridge.getPluginWsUrl({
+          pluginId: 'hermes-gemini-live',
+          path: RELAY_PATH.replace('/api/plugins/hermes-gemini-live', '')
+        })
+        if (typeof minted === 'string' && minted) return minted
+      }
+    } catch {
+      // fall through: the sibling mint is still right for a token-mode host
+    }
+  }
+  return resolveSiblingWsUrl({}, RELAY_PATH)
+}
+
 async function start (rest) {
   if (call.state !== 'idle') return
   call.state = 'connecting'
@@ -419,9 +494,16 @@ async function start (rest) {
   publish()
   void loadStatus(rest)
   call.player = call.player || createPlayer()
+  // The speaker choice rides the AudioContext, not the microphone: routing it wrong is
+  // silent (the model talks into a device nobody is listening to), so it is reported.
+  if (call.tuning.outputDevice && typeof call.player.setSink === 'function') {
+    void call.player.setSink(call.tuning.outputDevice).then(note => {
+      if (note) { call.detail = note; publish() }
+    })
+  }
   let url
   try {
-    url = await resolveSiblingWsUrl({}, RELAY_PATH)
+    url = await relayUrl()
   } catch (error) {
     tearDown(message(error))
     return
@@ -545,6 +627,246 @@ function TalkControl ({ rest }) {
     }, h(icons.VolumeX, { className: icons.iconSize.xs }), 'Stop'))
 }
 
+/* ─────────────────────────────── settings page ───────────────────────────────
+ * The form the plugin contributes to Settings ▸ Plugins (`registerSettingsPage`): the app
+ * renders it as its own rail entry with a gear in the plugin's card, so the preferences sit
+ * where every other plugin's do — outside the chat composer, so opening them can never
+ * tear down a running call.
+ *
+ * One control per field, chosen by the schema the backend reports: a dropdown for every
+ * enumerated choice (model, voice, protocol depth, delegation target, long-call policy),
+ * a number for the two millisecond knobs, a checkbox for audio flags, a textarea for the
+ * extra instruction. Nothing here is free text that the backend would have to guess at.
+ */
+const CONTROL_CLASS = 'h-8 w-full rounded-md border border-(--ui-stroke-secondary) ' +
+  'bg-transparent px-2 text-sm text-foreground focus-visible:outline-none ' +
+  'focus-visible:ring-1 focus-visible:ring-(--ui-accent)'
+
+function FieldRow ({ field, value, onChange }) {
+  let control
+  if (field.kind === 'enum') {
+    control = h('select', {
+      className: CONTROL_CLASS,
+      value: value == null ? field.default : value,
+      onChange: event => onChange(event.target.value)
+    }, (field.choices || []).map(choice => h('option', { key: choice, value: choice }, choice)))
+  } else if (field.kind === 'bool') {
+    control = h('label', { className: 'inline-flex items-center gap-2 text-sm' },
+      h('input', {
+        type: 'checkbox',
+        checked: value == null ? Boolean(field.default) : Boolean(value),
+        onChange: event => onChange(event.target.checked)
+      }),
+      h('span', { className: 'text-muted-foreground' }, value ? 'an' : 'aus'))
+  } else if (field.kind === 'int') {
+    control = h('input', {
+      type: 'number',
+      className: CONTROL_CLASS,
+      min: field.min,
+      max: field.max,
+      value: value == null ? field.default : value,
+      onChange: event => onChange(Number(event.target.value))
+    })
+  } else {
+    control = h('textarea', {
+      className: CONTROL_CLASS + ' h-auto py-2',
+      rows: 3,
+      maxLength: field.max_len || 2000,
+      value: value == null ? field.default : value,
+      onChange: event => onChange(event.target.value)
+    })
+  }
+  return h('div', { className: 'grid gap-1 border-b border-(--ui-stroke-tertiary) pb-3' },
+    h('div', { className: 'text-sm font-medium text-foreground' }, field.label),
+    field.help ? h('div', { className: 'text-xs text-muted-foreground' }, field.help) : null,
+    control)
+}
+
+
+/** Microphones and speakers the browser can see. Labels are empty until microphone
+ *  permission has been granted once, so the fallback is the kind plus its index. */
+function useAudioDevices (active) {
+  const [devices, setDevices] = useState({ inputs: [], outputs: [] })
+  useEffect(() => {
+    if (!active || !navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+      return
+    }
+    let live = true
+    const read = () => navigator.mediaDevices.enumerateDevices().then(list => {
+      if (!live) return
+      const pick = kind => list
+        .filter(device => device.kind === kind)
+        .map((device, index) => ({
+          id: device.deviceId,
+          label: device.label || (kind === 'audioinput'
+            ? `Mikrofon ${index + 1}`
+            : `Ausgabe ${index + 1}`)
+        }))
+      setDevices({ inputs: pick('audioinput'), outputs: pick('audiooutput') })
+    }).catch(() => undefined)
+    void read()
+    navigator.mediaDevices.addEventListener?.('devicechange', read)
+    return () => {
+      live = false
+      navigator.mediaDevices.removeEventListener?.('devicechange', read)
+    }
+  }, [active])
+  return devices
+}
+
+function DeviceRow ({ label, value, options, onChange }) {
+  return h('div', { className: 'grid gap-1 border-b border-(--ui-stroke-tertiary) pb-3' },
+    h('div', { className: 'text-sm font-medium text-foreground' }, label),
+    h('select', {
+      className: CONTROL_CLASS,
+      value: value || '',
+      onChange: event => onChange(event.target.value)
+    },
+    h('option', { value: '' }, 'Systemstandard'),
+    options.map(option => h('option', { key: option.id, value: option.id }, option.label))))
+}
+
+function money (value) {
+  return '$' + (Math.round(value * 1000) / 1000).toFixed(3)
+}
+
+function UsageBlock ({ usage }) {
+  if (!usage) return null
+  const day = usage.last_24h || {}
+  const all = usage.all_time || {}
+  const line = (label, bucket) => h('div', { className: 'flex items-baseline justify-between gap-3 text-sm' },
+    h('span', { className: 'text-muted-foreground' }, label),
+    h('span', { className: 'font-mono text-[0.75rem] text-foreground' },
+      `${bucket.calls || 0} Anrufe · ${Math.round((bucket.duration_ms || 0) / 1000)} s · ` +
+      `${bucket.input || 0}+${bucket.output || 0} tok · ${money(bucket.usd || 0)}` +
+      (bucket.unpriced ? ` (${bucket.unpriced} ohne Preis)` : '')))
+  return h('div', { className: 'grid gap-2 rounded-lg border border-(--ui-stroke-tertiary) p-3' },
+    h('div', { className: 'text-sm font-medium text-foreground' }, 'Verbrauch'),
+    line('Letzte 24 Stunden', day),
+    line('Gesamt', all),
+    h('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)' },
+      `Schätzung aus veröffentlichten Preisen (${usage.price_date}); keine Rechnung. ` +
+      'Delegierte Hermes-Arbeit ist nicht enthalten.'))
+}
+
+function SettingsPage ({ rest }) {
+  const [fields, setFields] = useState([])
+  const [values, setValues] = useState({})
+  const [draft, setDraft] = useState({})
+  const [status, setStatus] = useState('loading')
+  const [note, setNote] = useState('')
+  const [usage, setUsage] = useState(null)
+  const devices = useAudioDevices(status !== 'error')
+
+  useEffect(() => {
+    let live = true
+    rest('/settings').then(payload => {
+      if (!live) return
+      setFields(payload.fields || [])
+      setValues(payload.values || {})
+      setDraft(payload.values || {})
+      setStatus('ready')
+    }).catch(error => {
+      if (!live) return
+      setStatus('error')
+      setNote(message(error))
+    })
+    rest('/usage').then(payload => { if (live) setUsage(payload) }).catch(() => undefined)
+    return () => { live = false }
+  }, [rest])
+
+  const dirty = fields.some(field => draft[field.name] !== values[field.name])
+
+  async function save () {
+    setStatus('saving')
+    setNote('')
+    try {
+      const payload = await rest('/settings', { method: 'PUT', body: draft })
+      setValues(payload.values || {})
+      setDraft(payload.values || {})
+      setFields(payload.fields || fields)
+      setStatus('ready')
+      setNote('Gespeichert. Gilt ab dem nächsten Anruf.')
+    } catch (error) {
+      setStatus('ready')
+      setNote(message(error))
+    }
+  }
+
+  async function reloadModules () {
+    setStatus('saving')
+    setNote('')
+    try {
+      const payload = await rest('/reload', { method: 'POST' })
+      setStatus('ready')
+      setNote('Module neu geladen (' + (payload.reloaded || []).length + '). Gilt ab dem nächsten Anruf.')
+    } catch (error) {
+      setStatus('ready')
+      setNote(message(error))
+    }
+  }
+
+  if (status === 'loading') {
+    return h('div', { className: 'p-6 text-sm text-muted-foreground' }, 'Einstellungen werden geladen …')
+  }
+
+  return h('div', { className: 'mx-auto flex w-full max-w-2xl flex-col gap-4 p-6' },
+    h('div', { className: 'grid gap-1' },
+      h('h1', { className: 'text-lg font-semibold text-foreground' }, 'Gemini Live'),
+      h('p', { className: 'text-xs text-muted-foreground' },
+        'Stimme, Modell, Protokolltiefe und das Verhalten der delegierten Aufgaben. ' +
+        'Änderungen gelten für den nächsten Anruf.')),
+    h('div', { className: 'grid gap-4' },
+      h(DeviceRow, {
+        label: 'Mikrofon',
+        value: draft.input_device,
+        options: devices.inputs,
+        onChange: next => setDraft(previous => ({ ...previous, input_device: next }))
+      }),
+      h(DeviceRow, {
+        label: 'Lautsprecher',
+        value: draft.output_device,
+        options: devices.outputs,
+        onChange: next => setDraft(previous => ({ ...previous, output_device: next }))
+      })),
+    h('div', { className: 'grid gap-4' },
+      // The two device ids have their own pickers above; a textarea would be a second,
+      // worse way to set the same thing.
+      fields.filter(field => field.name !== 'input_device' && field.name !== 'output_device')
+        .map(field => h(FieldRow, {
+        key: field.name,
+        field,
+        value: draft[field.name],
+        onChange: next => setDraft(previous => ({ ...previous, [field.name]: next }))
+      }))),
+    h('div', { className: 'flex items-center gap-3' },
+      h('button', {
+        type: 'button',
+        disabled: !dirty || status === 'saving',
+        onClick: () => void save(),
+        className: 'inline-flex h-8 items-center rounded-md bg-(--ui-accent) px-3 text-sm ' +
+          'font-medium text-(--ui-accent-foreground) disabled:opacity-40'
+      }, status === 'saving' ? 'Speichert …' : 'Speichern'),
+      dirty
+        ? h('button', {
+          type: 'button',
+          onClick: () => setDraft({ ...values }),
+          className: 'text-xs text-muted-foreground underline-offset-2 hover:underline'
+        }, 'Verwerfen')
+        : null,
+      h('button', {
+        type: 'button',
+        title: 'Code-Änderungen dieses Plugins laden, ohne Hermes neu zu starten',
+        disabled: status === 'saving',
+        onClick: () => void reloadModules(),
+        className: 'text-xs text-muted-foreground underline-offset-2 hover:underline disabled:opacity-40'
+      }, 'Module neu laden'),
+      note ? h('span', { className: 'text-xs text-muted-foreground' }, note) : null),
+    h(UsageBlock, { usage }),
+    h('p', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)' },
+      'Ablage: ' + 'plugin-data/hermes-gemini-live/settings.json (überschreibt GEMINI_LIVE_*-Variablen).'))
+}
+
 export default {
   id: 'hermes-gemini-live',
   name: 'Gemini Live',
@@ -555,6 +877,16 @@ export default {
       area: 'composer.actions',
       order: 40,
       render: () => h(TalkControl, { rest: ctx.rest })
+    })
+    // Settings ▸ Plugins is this app's home for plugin preferences (WoW-AddOns style):
+    // one rail entry per plugin, own sub-pages beneath it. Optional chaining because a
+    // host older than the settings-page API must still get the call button.
+    ctx.registerSettingsPage?.({
+      id: 'settings',
+      title: 'Gemini Live',
+      icon: 'mic',
+      order: 40,
+      render: () => h(SettingsPage, { rest: ctx.rest })
     })
   }
 }

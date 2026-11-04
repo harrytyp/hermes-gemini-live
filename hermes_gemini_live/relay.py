@@ -16,13 +16,23 @@ import json
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
-from . import agent_lane, config, wire, tools as tools_module
+from . import agent_lane, config, session_log, transcript, usage as usage_module, wire, tools as tools_module
 from .config import ConfigError
 from .live_client import LiveError, LiveSession
 
 logger = logging.getLogger(__name__)
+
+#: How many relays are live right now. The reload endpoint refuses while one is: swapping
+#: module state under a running call is exactly the crash a restart used to avoid.
+_active_calls = 0
+
+
+def active_calls() -> int:
+    return _active_calls
+
 
 #: Audio frames arrive ~10/s; anything bigger than this is a bug or an attack.
 MAX_BROWSER_FRAME_BYTES = 1 << 20
@@ -47,6 +57,55 @@ NEEDS_NOTE = (
 #: result into the middle of its own speech makes it stop the sentence it was saying and read
 #: the report instead, which is what the user heard as being cut off.
 QUIET_BEFORE_NOTE_S = 1.0
+
+
+@dataclass
+class CallContext:
+    """What this call carries besides its two sockets: the words, and where they go.
+
+    ``transcript`` always exists (it is what a delegated task travels with).
+    ``log`` only has a session id when the configured depth writes rows or the
+    delegation target is the call's own session — a call that records nothing must not
+    create an empty session in the user's sidebar.
+    """
+
+    transcript: "transcript.Transcript"
+    log: "session_log.CallLog"
+    mode: str = "delegations"
+    target: str = "call_session"
+    include_context: bool = True
+    usage: "usage_module.Usage | None" = None
+    #: ``call_session`` mode: no session is minted up front (the server refuses to resume
+    #: one it did not create). The first delegated run's session becomes the call's.
+    adopt_first: bool = False
+
+    @property
+    def writes_rows(self) -> bool:
+        return session_log.wanted(self.mode)
+
+    @property
+    def call_session_id(self) -> str | None:
+        return self.log.session_id
+
+    def flush(self) -> int:
+        """Write the utterances that settled since the last flush. Never raises."""
+        if not self.writes_rows:
+            return 0
+        return self.log.append(self.transcript.pending_rows())
+
+    def note(self, text: str) -> None:
+        if self.mode == "full":
+            self.log.note(text)
+
+    def prompt_with_context(self, task: str) -> str:
+        """A task, prefixed with what was just said — only when the rows are not already
+        in the session the run resumes, so the worker never reads the same words twice.
+        """
+        if not self.include_context or self.writes_rows:
+            return task
+        window = transcript.labelled_block(self.transcript.context())
+        return f"{window}\n\n{task}" if window else task
+
 
 
 class NoteQueue:
@@ -90,7 +149,8 @@ class NoteQueue:
 
 async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
                            book: agent_lane.RunBook | None = None,
-                           session_key: str | None = None, profile: str | None = None) -> None:
+                           session_key: str | None = None, profile: str | None = None,
+                           ctx: CallContext | None = None) -> None:
     while True:
         message = await browser.receive_text()
         if len(message) > MAX_BROWSER_FRAME_BYTES:
@@ -101,7 +161,12 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
         elif kind == "text":
             await live.send_text(_text(message))
         elif kind == "approval" and book is not None:
-            await _user_approval(_loads(message), live, browser, book, session_key, profile)
+            value = _loads(message)
+            if ctx is not None:
+                # A note is a SQLite write: off the loop that carries audio, always.
+                await asyncio.to_thread(
+                    ctx.note, f"Nutzer-Entscheidung zu Aufgabe #{value.get('id')}: {value.get('choice')}")
+            await _user_approval(value, live, browser, book, session_key, profile)
         elif kind == "close":
             note["reason"] = "browser closed the call"
             return
@@ -109,12 +174,14 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
 
 async def _handle_tool_call(call: dict, live: LiveSession, browser: Any,
                             book: agent_lane.RunBook, session_key: str | None,
-                            profile: str | None, notes: NoteQueue) -> None:
+                            profile: str | None, notes: NoteQueue,
+                            ctx: CallContext | None = None) -> None:
     """Receipt first, work in the pool. The only await here is a small local socket send.
 
     The rule is about not waiting on a *run* (seconds to minutes), not about never
     awaiting: a receipt frame is what lets the model keep talking, so it goes out now.
     """
+    ctx = ctx or CallContext(transcript.Transcript(), session_log.CallLog(None))
     call_id = str(call.get("id") or "")
     name = call.get("name")
     args = call.get("args") or {}
@@ -122,7 +189,9 @@ async def _handle_tool_call(call: dict, live: LiveSession, browser: Any,
         logger.warning("hermes-gemini-live: tool call with no id was dropped")
         return
     if name == tools_module.BOARD_NAME:
-        await live.send_function_response(call_id, book.board(), name)
+        board = book.board()
+        await asyncio.to_thread(ctx.note, f"Task-Board gelesen:\n{board}")
+        await live.send_function_response(call_id, board, name)
         return
     if name == tools_module.UPDATE_NAME:
         await _update_task(call_id, args, live, browser, book, session_key, profile)
@@ -142,8 +211,10 @@ async def _handle_tool_call(call: dict, live: LiveSession, browser: Any,
     # worker — otherwise every task row ends with a paragraph about voice output.
     await browser.send_text(_dump({"type": "task_started", "id": call_id,
                                    "prompt": str(args.get("task") or "").strip()[:200]}))
+    await asyncio.to_thread(
+        ctx.note, f"Aufgabe #{call_id} gestartet: {str(args.get('task') or '').strip()[:400]}")
     agent_lane.start_task(
-        task,
+        ctx.prompt_with_context(task),
         on_finished=_make_finisher(notes, browser, loop),
         session_key=session_key,
         book=book,
@@ -151,6 +222,8 @@ async def _handle_tool_call(call: dict, live: LiveSession, browser: Any,
         # One name per task: the id in this receipt is the id the model addresses later.
         task_id=call_id,
         on_needs_input=_make_parker(notes, browser, loop),
+        session_id=ctx.call_session_id if ctx.target == "call_session" else None,
+        on_run=lambda run_id: _adopt_run_session(ctx, run_id, browser, loop, session_key, profile),
     )
 
 
@@ -230,6 +303,33 @@ async def _user_approval(value: dict, live: LiveSession, browser: Any,
                          "Acknowledge it in a few words.")
 
 
+def _adopt_run_session(ctx: CallContext, run_id: str, browser: Any,
+                       loop: asyncio.AbstractEventLoop, session_key: str | None,
+                       profile: str | None) -> None:
+    """Adopt the session the api_server created for this call's first run.
+
+    Runs on a worker thread (``on_run`` fires from the pool). Reading the run status is one
+    small local request; the row flush and the panel frame go back to the loop.
+    """
+    if not ctx.adopt_first or ctx.log.session_id:
+        return
+    try:
+        status = agent_lane.fetch(run_id, session_key=session_key, profile=profile)
+    except agent_lane.LaneUnavailable as exc:
+        logger.info("hermes-gemini-live: could not read the run's session (%s)", exc)
+        return
+    session_id = str(status.get("session_id") or "").strip()
+    if not session_id or not ctx.log.adopt(session_id, session_log.call_title()):
+        return
+    logger.info("hermes-gemini-live: adopted the call session %s from run %s",
+                session_id, run_id)
+
+    async def announce() -> None:
+        await browser.send_text(_dump({"type": "call_session", "id": session_id}))
+
+    _hand_off(announce(), loop, "session", "adopted")
+
+
 def _hand_off(coro, loop: asyncio.AbstractEventLoop, task_id: str, why: str) -> None:
     try:
         asyncio.run_coroutine_threadsafe(coro, loop)
@@ -284,7 +384,9 @@ async def _release(notes: NoteQueue, task_id: str, why: str) -> None:
 
 async def _live_to_browser(browser: Any, live: LiveSession, note: dict,
                            book: agent_lane.RunBook, session_key: str | None,
-                           profile: str | None, notes: NoteQueue) -> None:
+                           profile: str | None, notes: NoteQueue,
+                           ctx: CallContext | None = None) -> None:
+    ctx = ctx or CallContext(transcript.Transcript(), session_log.CallLog(None))
     while True:
         try:
             # The timeout is not a liveness check, it is the other half of the queue: a
@@ -294,21 +396,71 @@ async def _live_to_browser(browser: Any, live: LiveSession, note: dict,
         except asyncio.TimeoutError:
             await notes.release_quietly()
             continue
+        raw_usage = raw.get("usageMetadata")
+        if isinstance(raw_usage, dict) and ctx.usage is not None:
+            ctx.usage.tokens(raw_usage)
         for frame in wire.browser_frames(raw):
-            if frame["type"] == "audio":
+            kind = frame["type"]
+            if kind == "usage" and ctx.usage is not None:
+                frame["usd"] = ctx.usage.usd
+                frame["unpriced"] = ctx.usage.unpriced
+            if kind == "audio":
                 notes.speaking()
+            if kind == "in_text":
+                ctx.transcript.add(transcript.USER, str(frame.get("text") or ""))
+            elif kind == "out_text":
+                ctx.transcript.add(transcript.ASSISTANT, str(frame.get("text") or ""))
+            elif kind == "speech_started":
+                ctx.transcript.interrupted()
+            elif kind == "turn_complete":
+                ctx.transcript.turn_complete()
+                # A row write is SQLite: it goes off the loop that carries audio, and a
+                # refusal inside it is already absorbed by the log.
+                await asyncio.to_thread(ctx.flush)
+            elif kind == "resumption":
+                handle = str(frame.get("handle") or "")
+                if handle:
+                    note["handle"] = handle
+            elif kind == "go_away":
+                await _on_going_away(note, ctx, frame)
+                if note.get("stop_now"):
+                    await browser.send_text(_dump(frame))
+                    return
             await browser.send_text(_dump(frame))
-            if frame["type"] == "error":
+            if kind == "error":
                 note["reason"] = frame["detail"]
                 return
-            if frame["type"] in TERMINAL_FRAME_TYPES:
+            if kind in TERMINAL_FRAME_TYPES:
                 note["reason"] = f"server ended the session ({frame.get('timeLeft') or 'now'})"
                 return
-            if frame["type"] == "tool_call":
+            if kind == "tool_call":
                 for call in frame["calls"]:
                     await _handle_tool_call(call, live, browser, book, session_key,
-                                            profile, notes)
+                                            profile, notes, ctx)
         await notes.release_quietly()
+
+
+async def _on_going_away(note: dict, ctx: CallContext, frame: dict) -> None:
+    """The server announced the end of this session: keep, restart, or hang up.
+
+    ``auto_restart`` is what makes a long call usable: Gemini hands out a resumption
+    handle with every update, and re-opening with it continues the same conversation
+    instead of making the user dial again.
+    """
+    time_left = str(frame.get("timeLeft") or "")
+    mode = "keep"
+    try:
+        mode = config.long_call()
+    except Exception:
+        pass
+    note["reason"] = f"server ended the session ({time_left or 'now'})"
+    if mode == "hang_up":
+        note["stop_now"] = True
+    elif mode == "auto_restart" and note.get("handle") and not note.get("restarted"):
+        note["stop_now"] = True
+        note["restart"] = True
+    logger.info("hermes-gemini-live: session ending in %s (mode=%s, handle=%s)",
+                time_left or "now", mode, bool(note.get("handle")))
 
 
 def _loads(message: str) -> dict:
@@ -347,6 +499,16 @@ def _dump(frame: dict) -> str:
 async def run_relay(browser: Any, session_key: str | None = None,
                      profile: str | None = None) -> None:
     """Own the whole call. The caller has already accepted the upgrade."""
+    global _active_calls
+    _active_calls += 1
+    try:
+        await _run_relay(browser, session_key=session_key, profile=profile)
+    finally:
+        _active_calls = max(0, _active_calls - 1)
+
+
+async def _run_relay(browser: Any, session_key: str | None = None,
+                     profile: str | None = None) -> None:
     note: dict = {"reason": ""}
     # The serving home decides the profile, not a query parameter a client could send:
     # an unprefixed run resumes in the DEFAULT profile's store, so this is the one place
@@ -359,60 +521,111 @@ async def run_relay(browser: Any, session_key: str | None = None,
     if not offer_tools:
         logger.warning("hermes-gemini-live: agent lane unavailable (%s: %s)",
                        lane_status, lane_detail)
+    # One read per call: a settings change mid-call must not reshape a running session.
+    mode = session_log.mode_for()
     try:
-        live = await LiveSession.open(tools_module.declarations() if offer_tools else None)
-    except (LiveError, ConfigError) as exc:
-        logger.warning("hermes-gemini-live: call refused: %s", exc)
-        await browser.send_text(_dump({"type": "error", "detail": str(exc)}))
-        return
-    if not offer_tools:
-        await browser.send_text(_dump({"type": "lane", "status": lane_status,
-                                       "detail": lane_detail}))
+        target = config.delegation_target()
+    except Exception:
+        target = "call_session"
+    try:
+        include_context = config.include_voice_context()
+    except Exception:
+        include_context = True
+    ctx = CallContext(transcript=transcript.Transcript(), log=session_log.CallLog(None),
+                      mode=mode, target=target, include_context=include_context)
+    # A call that records nothing must not mint an empty session in the user's sidebar;
+    # delegations need one when they are meant to land in it.
+    # ``call_session`` waits for the run to hand us its session (see _adopt_run_session);
+    # only a recording mode that is not adopting needs one up front.
+    ctx.adopt_first = target == "call_session"
+    mint_here = session_log.wanted(mode) and not ctx.adopt_first
+    if mint_here and agent_lane.key():
+        ctx.log = await asyncio.to_thread(session_log.CallLog.create, profile, session_key)
+        if ctx.log.session_id:
+            logger.info("hermes-gemini-live: call session %s (mode=%s, target=%s)",
+                        ctx.log.session_id, mode, target)
+            await asyncio.to_thread(ctx.log.rename, session_log.call_title())
+            await browser.send_text(_dump({"type": "call_session", "id": ctx.log.session_id}))
+    # Durable board (hermes-live-voice's receipts): the file outlives the socket, so a
+    # reconnect — or simply the next morning — can still answer "what did I start?".
+    book = agent_lane.RunBook(session_log.board_path(ctx.log.session_id)
+                              if ctx.log.session_id else None)
+    tools = tools_module.declarations() if offer_tools else None
+    attempt = 0
+    while True:
+        try:
+            live = await LiveSession.open(tools, handle=note.get("handle") if attempt else None)
+        except (LiveError, ConfigError) as exc:
+            logger.warning("hermes-gemini-live: call refused: %s", exc)
+            await browser.send_text(_dump({"type": "error", "detail": str(exc)}))
+            break
+        if not offer_tools and attempt == 0:
+            await browser.send_text(_dump({"type": "lane", "status": lane_status,
+                                           "detail": lane_detail}))
+        notes = NoteQueue(live)
+        ctx.usage = usage_module.Usage(getattr(live, "model", "") or "")
+        if attempt:
+            await live.send_text("The connection was resumed. Say in one short sentence that "
+                                 "you are back, then wait for the user.")
+        up = asyncio.create_task(_browser_to_live(browser, live, note, book, session_key,
+                                                  profile, ctx))
+        down = asyncio.create_task(_live_to_browser(browser, live, note, book, session_key,
+                                                    profile, notes, ctx))
+        try:
+            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                error = task.exception()
+                if not error:
+                    continue
+                note["reason"] = str(error)
+                if task is up:
+                    # Which pump failed says who left. The browser pump only dies when the page
+                    # goes away — a navigation, not a fault — and there is nobody to tell, so
+                    # this is logged as an ordinary end. The panel used to receive an error
+                    # frame here, which read as "the system failed" every time the user clicked
+                    # somewhere else mid-call.
+                    logger.info("hermes-gemini-live: call ended (%s from the browser side)",
+                                type(error).__name__)
+                    continue
+                logger.warning("hermes-gemini-live: relay pump failed: %s: %s",
+                               type(error).__name__, error)
+                await browser.send_text(_dump({"type": "error", "detail": _safe(error),
+                                               "ended": True}))
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            # A pump that lost the race can finish with an exception nobody asked for — the
+            # cancel lands after it already raised. Retrieving it here keeps asyncio from
+            # printing a bare traceback that looks like a crash in the log.
+            for task in (up, down):
+                if task.done() and not task.cancelled():
+                    task.exception()
+            await live.close()
+            # Whatever was said last still belongs in the session, even if the words came
+            # in without a turnComplete (a hang-up mid-sentence).
+            await asyncio.to_thread(ctx.flush)
+            if ctx.usage is not None:
+                await asyncio.to_thread(usage_module.record, ctx.usage.close())
+                ctx.usage = None
+            if notes.waiting():
+                # Queued and never spoken: the result is real, the user simply hung up first.
+                logger.info("hermes-gemini-live: call ended with %d result(s) still queued",
+                            notes.waiting())
+        restart = bool(note.get("restart")) and attempt == 0
+        note.pop("restart", None)
+        note.pop("stop_now", None)
+        if restart:
+            attempt = 1
+            note["restarted"] = True
+            logger.info("hermes-gemini-live: session resumed on a fresh socket")
+            continue
+        break
+    if book.pending():
+        logger.info("hermes-gemini-live: call ended with %d run(s) still going: %s",
+                    len(book.pending()), ",".join(book.pending()))
+    logger.info("hermes-gemini-live: call ended (%s)", note["reason"] or "ended")
 
-    book = agent_lane.RunBook()
-    notes = NoteQueue(live)
-    up = asyncio.create_task(_browser_to_live(browser, live, note, book, session_key, profile))
-    down = asyncio.create_task(_live_to_browser(browser, live, note, book, session_key,
-                                                profile, notes))
-    try:
-        done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            error = task.exception()
-            if not error:
-                continue
-            note["reason"] = str(error)
-            if task is up:
-                # Which pump failed says who left. The browser pump only dies when the page
-                # goes away — a navigation, not a fault — and there is nobody to tell, so
-                # this is logged as an ordinary end. The panel used to receive an error
-                # frame here, which read as "the system failed" every time the user clicked
-                # somewhere else mid-call.
-                logger.info("hermes-gemini-live: call ended (%s from the browser side)",
-                            type(error).__name__)
-                continue
-            logger.warning("hermes-gemini-live: relay pump failed: %s: %s",
-                           type(error).__name__, error)
-            await browser.send_text(_dump({"type": "error", "detail": _safe(error),
-                                           "ended": True}))
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-    finally:
-        # A pump that lost the race can finish with an exception nobody asked for — the
-        # cancel lands after it already raised. Retrieving it here keeps asyncio from
-        # printing a bare traceback that looks like a crash in the log.
-        for task in (up, down):
-            if task.done() and not task.cancelled():
-                task.exception()
-        await live.close()
-        if notes.waiting():
-            # Queued and never spoken: the result is real, the user simply hung up first.
-            logger.info("hermes-gemini-live: call ended with %d result(s) still queued",
-                        notes.waiting())
-        if book.pending():
-            logger.info("hermes-gemini-live: call ended with %d run(s) still going: %s",
-                        len(book.pending()), ",".join(book.pending()))
-        logger.info("hermes-gemini-live: call ended (%s)", note["reason"] or "ended")
 
 
 def _safe(error: BaseException) -> str:

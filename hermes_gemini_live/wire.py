@@ -25,7 +25,8 @@ def wire_model(model: str) -> str:
 def build_setup(*, model: str, voice: str, instructions: str,
                 thinking_level: str | None = None,
                 activity: dict | None = None,
-                tools: list[dict] | None = None) -> dict:
+                tools: list[dict] | None = None,
+                resume_handle: str | None = None) -> dict:
     setup = {
         "model": wire_model(model),
         "generationConfig": {
@@ -35,7 +36,11 @@ def build_setup(*, model: str, voice: str, instructions: str,
         "systemInstruction": {"parts": [{"text": instructions}]},
         "inputAudioTranscription": {},
         "outputAudioTranscription": {},
-        "sessionResumption": {},
+        # The handle is what lets a call outlive one socket: Gemini hands one out with
+        # every ``sessionResumptionUpdate`` and continues the same conversation when the
+        # next setup carries it. Which makes the difference between a 15-minute call and
+        # one that keeps going.
+        "sessionResumption": {"handle": resume_handle} if resume_handle else {},
         # Google owns the trim: it cuts at 80% of the context window toward half of
         # that, and never cuts the system instruction. Without it an audio-only session
         # hard-stops near 15 minutes.

@@ -15,14 +15,19 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +180,16 @@ def probe(session_key: str | None = None, profile: str | None = None) -> tuple[s
 
 def submit(prompt: str, session_id: str | None = None,
            session_key: str | None = None, profile: str | None = None) -> str:
-    """POST /v1/runs. Returns the run id; accepts any 2xx, not only 202."""
+    """POST /v1/runs. Returns the run id; accepts any 2xx, not only 202.
+
+    A refused *resume* is not a refused task. The api_server only admits a run into a
+    session its own principal owns (``api_server_response_admissions.py`` answers
+    ``permission_denied`` otherwise — surfaced as HTTP 409 through
+    ``store_error_response``'s default). A call session created through
+    ``POST /api/sessions`` is not such a session, so the run is retried once without the
+    address: the work lands in its own session, which is what the user asked for in the
+    first place. Losing the bookkeeping is cheaper than losing the task.
+    """
     body: dict = {"input": prompt}
     if session_id:
         body["session_id"] = session_id
@@ -185,8 +199,13 @@ def submit(prompt: str, session_id: str | None = None,
     except httpx.HTTPError as exc:
         raise LaneUnavailable(f"I couldn't reach the Hermes api server ({type(exc).__name__})") from exc
     if response.status_code // 100 != 2:
+        detail = response.text[:200] or "no detail"
+        if session_id and response.status_code in (403, 409) and "permission" in detail.lower():
+            logger.info("hermes-gemini-live: the api server refused to resume %s (%s); "
+                        "submitting the task in its own session", session_id, response.status_code)
+            return submit(prompt, session_id=None, session_key=session_key, profile=profile)
         raise LaneUnavailable(f"the Hermes api server refused the run ({response.status_code}): "
-                              f"{response.text[:200] or 'no detail'}")
+                              f"{detail}")
     try:
         payload = response.json()
     except ValueError as exc:
@@ -309,6 +328,12 @@ def await_result(run_id: str, session_key: str | None = None,
         if state in TERMINAL_STATUSES:
             if state == "completed":
                 return state, speakable(str(status_row.get("output") or ""))
+            if state == "interrupted":
+                # Adopted from hermes-live-voice's task contract: the gateway restarted
+                # under the run, so the outcome is unknowable. Claiming failure would be
+                # as wrong as claiming success.
+                return "unknown", ("Hermes was restarted while that task was running, so its "
+                                   "outcome is unknown — ask me to check the session.")
             detail = status_row.get("error") or state
             return state, speakable(str(detail))
         if state == NEEDS_INPUT and on_needs_input is not None:
@@ -337,17 +362,39 @@ class RunBook:
 
     Kept across a call so the model can be asked "what happened with the other one" without
     re-running it, and so a task the model addressed by id can be resolved back to its run.
+
+    Durability, adopted from hermes-live-voice's task receipts: the board is written to disk
+    after every change, because the things that outlive a socket are exactly the things the
+    user asks about when they call back. A lost call loses the microphone, not the record of
+    what was started.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path: str | Path | None = None) -> None:
         self._tasks: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._path = Path(path) if path else None
+
+    def _save(self) -> None:
+        """Write the board out. Best-effort: a full disk must not fail a call."""
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"tasks": list(self._tasks.values()), "at": time.time()}
+            handle, tmp = tempfile.mkstemp(prefix="board-", suffix=".json",
+                                           dir=str(self._path.parent))
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            logger.info("hermes-gemini-live: board not saved (%s)", type(exc).__name__)
 
     def register(self, task_id: str, prompt: str) -> None:
         with self._lock:
             self._tasks[task_id] = {"id": task_id, "prompt": prompt[:120], "run_id": None,
                                     "state": "running", "question": "", "result": "",
                                     "request_id": ""}
+            self._save()
 
     def run_id(self, task_id: str) -> str | None:
         with self._lock:
@@ -366,6 +413,7 @@ class RunBook:
             task = self._tasks.get(task_id)
             if task is not None:
                 task["run_id"] = run_id
+                self._save()
 
     def set_state(self, task_id: str, state: str, *, question: str = "",
                   result: str = "", request_id: str = "") -> None:
@@ -380,12 +428,13 @@ class RunBook:
                 task["result"] = result[:MAX_SPEAKABLE_CHARS]
             if request_id:
                 task["request_id"] = request_id
+            self._save()
 
     def pending(self) -> list[str]:
         """Task ids still open — working or waiting on someone."""
         with self._lock:
             return sorted(key for key, task in self._tasks.items()
-                          if task["state"] in ("running", "needs_input"))
+                          if task["state"] in ("queued", "running", "needs_input"))
 
     def board(self) -> str:
         """One line per task, oldest first — the text the model reads when it asks."""
@@ -400,40 +449,108 @@ class RunBook:
             for task in rows)
 
 
+class _Scheduler:
+    """Admission for delegated runs: one at a time unless the operator allowed overlap.
+
+    Adopted from hermes-live-voice, which defaults to ``exclusive`` for anything with side
+    effects — two agents editing one repository is not a feature. The queue is in memory
+    like the runs themselves; a body that survives a restart is the board on disk, not this.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: deque = deque()
+        self._running = 0
+
+    def admit(self, begin) -> bool:
+        with self._lock:
+            try:
+                policy = config.concurrency()
+            except Exception:
+                policy = "exclusive"
+            start_now = policy == "parallel" or self._running == 0
+            if start_now:
+                self._running += 1
+            else:
+                self._queue.append(begin)
+        if start_now:
+            begin()
+        return start_now
+
+    def finished(self) -> None:
+        with self._lock:
+            self._running = max(0, self._running - 1)
+            following = self._queue.popleft() if (self._queue and self._running == 0) else None
+            if following is not None:
+                self._running += 1
+        if following is not None:
+            following()
+
+    def queued(self) -> int:
+        return len(self._queue)
+
+
+_SCHEDULER = _Scheduler()
+
+
 def start_task(prompt: str, on_finished, session_key: str | None = None,
                book: RunBook | None = None, profile: str | None = None,
-               task_id: str | None = None, on_needs_input=None) -> str:
+               task_id: str | None = None, on_needs_input=None,
+               session_id: str | None = None, on_run=None) -> str:
     """Hand a task to the pool and return immediately.
 
     ``on_finished(task_id, state, text)`` is called later from a worker thread, so the
     caller owns whatever it takes to get that result back onto its event loop. ``task_id`` is
     passed by the relay as the model's own call id, so the id the model hears in the receipt
     is the id it addresses later — one name per task, not two.
+
+    ``session_id`` resumes that stored session instead of minting one per run: the call's
+    own transcript is where the work belongs when the panel asks for it, and it is what
+    lets a later task see what an earlier one already did.
     """
     task_id = task_id or uuid.uuid4().hex[:8]
     if book is not None:
         book.register(task_id, prompt)
 
-    def worker() -> tuple[str, str]:
-        try:
-            run_id = submit(prompt, session_key=session_key, profile=profile)
-            if book is not None:
-                book.attach_run(task_id, run_id)
-            return await_result(run_id, session_key=session_key, profile=profile,
-                                on_needs_input=_parked(book, task_id, on_needs_input))
-        except LaneUnavailable as exc:
-            return "unavailable", speakable(str(exc))
-
-    future = _POOL.submit(worker)
-
-    def deliver() -> None:
-        state, text = future.result()
+    def begin() -> None:
         if book is not None:
-            book.set_state(task_id, state, result=text)
-        on_finished(task_id, state, text)
+            book.set_state(task_id, "running")
 
-    watcher = threading.Thread(target=deliver, name=f"gml-deliver-{task_id}", daemon=True)
-    future.add_done_callback(lambda _f: watcher.start())
+        def worker() -> tuple[str, str]:
+            try:
+                run_id = submit(prompt, session_id=session_id, session_key=session_key,
+                                profile=profile)
+                if book is not None:
+                    book.attach_run(task_id, run_id)
+                if on_run is not None:
+                    # Called from this worker thread, once the run exists: the relay uses it
+                    # to learn the session the api_server created for the first task.
+                    try:
+                        on_run(run_id)
+                    except Exception:
+                        logger.debug("hermes-gemini-live: on_run hook failed", exc_info=True)
+                return await_result(run_id, session_key=session_key, profile=profile,
+                                    on_needs_input=_parked(book, task_id, on_needs_input))
+            except LaneUnavailable as exc:
+                return "unavailable", speakable(str(exc))
+
+        future = _POOL.submit(worker)
+
+        def deliver() -> None:
+            try:
+                state, text = future.result()
+                if book is not None:
+                    book.set_state(task_id, state, result=text)
+                on_finished(task_id, state, text)
+            finally:
+                # Releases the next queued task, whatever happened to this one.
+                _SCHEDULER.finished()
+
+        watcher = threading.Thread(target=deliver, name=f"gml-deliver-{task_id}", daemon=True)
+        future.add_done_callback(lambda _f: watcher.start())
+
+    if not _SCHEDULER.admit(begin) and book is not None:
+        book.set_state(task_id, "queued")
     return task_id
 
 
