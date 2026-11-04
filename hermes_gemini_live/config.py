@@ -262,6 +262,18 @@ def concurrency() -> str:
     return str(_setting("concurrency") or "exclusive")
 
 
+def wake_provider() -> str:
+    """Which engine to ask for: ``auto`` means "whatever Hermes ships and is present"."""
+    stored = _setting("wake_provider")
+    return str(stored or "auto")
+
+
+def wake_word() -> bool:
+    """Whether this plugin may own "hey Hermes" — only with the core wake word switched off."""
+    stored = _setting("wake_word")
+    return False if stored is None else bool(stored)
+
+
 def input_device() -> str:
     """Preferred microphone device id, or '' for the system default."""
     return str(_setting("input_device") or "")

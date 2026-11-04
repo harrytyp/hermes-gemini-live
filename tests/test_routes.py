@@ -147,7 +147,7 @@ def test_a_refused_value_is_a_400_and_changes_nothing(client):
     api.put(f"{_PREFIX}/settings", json={"long_call": "hang_up"})
     response = api.put(f"{_PREFIX}/settings", json={"long_call": "explode"})
     assert response.status_code == 400
-    assert "long_call" in response.json()["detail"] or "Wenn die Session" in response.json()["detail"]
+    assert "Wenn der Anruf" in response.json()["detail"] or "keep" in response.json()["detail"]
     assert api.get(f"{_PREFIX}/settings").json()["values"]["long_call"] == "hang_up"
 
 
@@ -180,3 +180,98 @@ def test_status_reports_the_devices_the_renderer_must_use(client):
     api.put(f"{_PREFIX}/settings", json={"input_device": "mic-1", "output_device": "spk-2"})
     devices = api.get(f"{_PREFIX}/status").json()["devices"]
     assert devices == {"input": "mic-1", "output": "spk-2"}
+
+
+def test_saving_the_wake_switch_stops_the_other_listener_first(client, monkeypatch):
+    http, module = client
+    order: list[str] = []
+
+    monkeypatch.setattr(module.wake, "core_state",
+                        lambda: {"enabled": True, "listening": True})
+    monkeypatch.setattr(module.wake, "stop_core_listener",
+                        lambda: order.append("off") or {"stopped": True, "verified": True,
+                                                        "config": True, "core": {}})
+    monkeypatch.setattr(module.wake, "arm", lambda: order.append("arm") or {"armed": True})
+
+    response = http.put(f"{_PREFIX}/settings", json={"wake_word": True})
+
+    assert response.status_code == 200
+    assert order == ["off", "arm"], "the other detector must be off before this one listens"
+    assert response.json()["wake"]["stopped"] is True
+
+
+def test_a_refused_shutdown_keeps_the_switch_off(client, monkeypatch):
+    http, module = client
+    monkeypatch.setattr(module.wake, "core_state",
+                        lambda: {"enabled": True, "listening": True})
+    monkeypatch.setattr(module.wake, "stop_core_listener",
+                        lambda: {"stopped": False, "verified": False, "config": False,
+                                 "reason": "Zuhörer läuft in einem anderen Prozess"})
+    before = http.get(f"{_PREFIX}/settings").json()["values"]["wake_word"]
+
+    response = http.put(f"{_PREFIX}/settings", json={"wake_word": True})
+
+    assert response.status_code == 409
+    assert "anderen Prozess" in response.json()["detail"]
+    assert http.get(f"{_PREFIX}/settings").json()["values"]["wake_word"] == before
+
+
+def test_wake_state_is_part_of_status(client, monkeypatch):
+    http, module = client
+    monkeypatch.setattr(module.wake, "status",
+                        lambda: {"armed": False, "reason": "Engine fehlt", "pending": 0.0,
+                                 "core": {"enabled": False, "listening": False}})
+    payload = http.get(f"{_PREFIX}/status").json()
+    assert payload["wake"]["reason"] == "Engine fehlt"
+    assert payload["wake"]["core"] == {"enabled": False, "listening": False}
+
+
+def test_without_a_running_detector_nothing_is_stopped_and_the_switch_still_arms(client,
+                                                                                monkeypatch):
+    http, module = client
+    calls: list[str] = []
+    monkeypatch.setattr(module.wake, "core_state", lambda: {"enabled": False, "listening": False})
+    monkeypatch.setattr(module.wake, "stop_core_listener",
+                        lambda: calls.append("off") or {"stopped": False, "verified": False})
+    monkeypatch.setattr(module.wake, "arm", lambda: calls.append("arm") or {"armed": True})
+
+    response = http.put(f"{_PREFIX}/settings", json={"wake_word": True})
+
+    assert response.status_code == 200
+    assert calls == ["arm"], "no listener, nothing to shut down"
+
+
+def test_a_failed_arm_writes_nothing(client, monkeypatch):
+    http, module = client
+    monkeypatch.setattr(module.wake, "core_state", lambda: {"enabled": False, "listening": False})
+    monkeypatch.setattr(module.wake, "arm", lambda: {
+        "armed": False, "reason": "Wake-Word konnte nicht starten",
+        "requirements": {"hint": "hermes pm install --extra wake-openwakeword"}})
+    before = http.get(f"{_PREFIX}/settings").json()["values"]
+
+    response = http.put(f"{_PREFIX}/settings", json={"wake_word": True})
+
+    assert response.status_code == 409
+    assert "pm install" in response.json()["detail"]
+    assert http.get(f"{_PREFIX}/settings").json()["values"] == before, \
+        "a refused arm must not leave the switch on"
+
+
+def test_the_engine_can_be_installed_from_the_panel(client, monkeypatch):
+    http, module = client
+    monkeypatch.setattr(module.wake, "ensure_engine",
+                        lambda: {"installed": True, "verified": True, "detail": "Engine installiert."})
+    response = http.put(f"{_PREFIX}/settings", json={"install_engine": True})
+    assert response.status_code == 200
+    assert response.json()["installed"]["verified"] is True
+    assert "install_engine" not in response.json()["values"]
+
+
+def test_a_failed_engine_install_is_reported_with_its_own_words(client, monkeypatch):
+    http, module = client
+    monkeypatch.setattr(module.wake, "ensure_engine",
+                        lambda: {"installed": False, "verified": False,
+                                 "detail": "Installation lief, aber das Modul fehlt weiterhin: x"})
+    response = http.put(f"{_PREFIX}/settings", json={"install_engine": True})
+    assert response.status_code == 409
+    assert "fehlt weiterhin" in response.json()["detail"]

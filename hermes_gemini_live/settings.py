@@ -32,6 +32,7 @@ PLUGIN_ID = "hermes-gemini-live"
 #: measured: a third id offered from memory would be a guess the panel makes for the user.
 MODEL_CHOICES = (config.DEFAULT_MODEL, config.DEFAULT_MODEL + "-extended-thinking")
 
+WAKE_PROVIDERS = ("auto", "sherpa", "openwakeword", "porcupine")
 TRANSCRIPT_MODES = ("delegations", "utterances", "full")
 DELEGATION_TARGETS = ("active_session", "own_session", "call_session")
 LONG_CALL_MODES = ("keep", "auto_restart", "hang_up")
@@ -55,12 +56,16 @@ class Field:
     high: int | None = None
     max_len: int = 2000
     env: str = ""
+    #: Plain-language text per enum value. The wire value stays technical (it is what the
+    #: code branches on); only what the dropdown shows is written for a human.
+    choice_labels: dict = field(default_factory=dict)
 
     def to_wire(self) -> dict:
         out: dict[str, Any] = {"name": self.name, "kind": self.kind, "default": self.default,
                                "label": self.label, "help": self.help}
         if self.choices:
             out["choices"] = list(self.choices)
+            out["choice_labels"] = {c: self.choice_labels.get(c, c) for c in self.choices}
         if self.low is not None:
             out["min"] = self.low
         if self.high is not None:
@@ -73,65 +78,81 @@ class Field:
 FIELDS: tuple[Field, ...] = (
     Field("transcript_mode", "enum", "delegations",
           "Protokolltiefe",
-          "delegations: nur die delegierten Aufgaben; utterances: zusätzlich jede "
-          "gesprochene Äußerung als Zeile; full: zusätzlich Steuerbefehle und Status.",
-          choices=TRANSCRIPT_MODES),
+          "Was landet im Verlauf: nur die Delegationen oder auch das Gesprochene.",
+          choices=TRANSCRIPT_MODES,
+          choice_labels={"delegations": "nur Delegationen",
+                         "utterances": "Delegationen und Äußerungen",
+                         "full": "alles"}),
     Field("delegation_target", "enum", "active_session",
-          "Wohin die Arbeit geht",
-          "active_session: der Anruf hängt sich an den gerade offenen Chat — dieselbe "
-          "Historie, dieselbe Memory, Text und Stimme abwechselnd (so macht es auch die "
-          "eingebaute Sprachfunktion); own_session: jede Aufgabe bekommt ihre eigene "
-          "Session; call_session: die Arbeit landet im Protokoll des Anrufs, das der erste "
-          "Lauf anlegt.",
-          choices=DELEGATION_TARGETS),
+          "Ziel für Aufgaben",
+          "active_session schreibt in den Chat, der gerade offen ist.",
+          choices=DELEGATION_TARGETS,
+          choice_labels={"active_session": "im offenen Chat",
+                         "own_session": "eigene Session",
+                         "call_session": "Session des Anrufs"}),
     Field("include_voice_context", "bool", True,
-          "Gesprochenen Kontext mitgeben",
-          "Der Arbeiter sieht die letzten gesprochenen Sätze, nicht nur den Auftrag.",
-          env=config.ENV_PREFIX + "VOICE_CONTEXT"),
+          "Letzte Sätze mitgeben",
+          "Die delegierte Aufgabe bekommt den letzten Gesprächsausschnitt als Kontext."),
     Field("concurrency", "enum", "exclusive",
-          "Aufgaben gleichzeitig",
-          "exclusive: eine Aufgabe nach der anderen (sicher bei Schreibzugriffen); "
-          "parallel: bis zu vier gleichzeitig, wie bisher.",
-          choices=CONCURRENCY_MODES),
+          "Nebenläufigkeit",
+          "exclusive wartet auf die vorige Aufgabe; parallel startet bis zu vier.",
+          choices=CONCURRENCY_MODES,
+          choice_labels={"exclusive": "nacheinander",
+                         "parallel": "parallel"}),
     Field("long_call", "enum", "auto_restart",
-          "Wenn die Session volläuft",
-          "keep: Anruf endet, wie der Server es sagt; auto_restart: einmal mit dem "
-          "Fortsetzungs-Handle neu verbinden; hang_up: sofort auflegen.",
-          choices=LONG_CALL_MODES),
-    Field("model", "enum", config.DEFAULT_MODEL, "Gemini-Modell", "",
+          "Bei sehr langem Anruf",
+          "",
+          choices=LONG_CALL_MODES,
+          choice_labels={"keep": "weiterlaufen",
+                         "auto_restart": "neu verbinden",
+                         "hang_up": "auflegen"}),
+    Field("model", "enum", config.DEFAULT_MODEL, "Welches Gemini", "",
           choices=MODEL_CHOICES, env=config.ENV_PREFIX + "MODEL"),
-    Field("model_fallback", "bool", True, "Modell-Ausweichen",
-          "Wenn das gewählte Modell die Session nicht öffnet: das nächste aus der Liste "
-          "versuchen, statt den Anruf abzubrechen."),
+    Field("model_fallback", "bool", True, "Modell-Fallback",
+          "Nimmt ein anderes Live-Modell, wenn das gewählte nicht antwortet."),
     Field("input_device", "text", "", "Mikrofon",
-          "Geräte-ID aus der Auswahl. Leer = Systemstandard.", max_len=200),
+          "Leer = Systemstandard.", max_len=200),
     Field("output_device", "text", "", "Lautsprecher",
-          "Geräte-ID aus der Auswahl. Leer = Systemstandard.", max_len=200),
-    Field("voice", "enum", config.DEFAULT_VOICE, "Stimme", "",
+          "Leer = Systemstandard.", max_len=200),
+    Field("voice", "enum", config.DEFAULT_VOICE, "Welche Stimme", "",
           choices=config.LIVE_VOICES, env=config.ENV_PREFIX + "VOICE"),
-    Field("thinking_level", "enum", config.DEFAULT_THINKING_LEVEL, "Denkstufe",
-          "Nur das extended-thinking-Modell liest diesen Wert.",
-          choices=config.THINKING_LEVELS, env=config.ENV_PREFIX + "THINKING_LEVEL"),
-    Field("silence_ms", "int", config.DEFAULT_SILENCE_MS, "Stille bis Turn-Ende (ms)",
-          "Wie lange es still sein muss, bevor das Modell den Turn als beendet ansieht.",
+    Field("thinking_level", "enum", config.DEFAULT_THINKING_LEVEL, "Denktiefe",
+          "Nur für Modelle mit extended-thinking.",
+          choices=config.THINKING_LEVELS,
+          choice_labels={"high": "lang", "low": "kurz"},
+          env=config.ENV_PREFIX + "THINKING_LEVEL"),
+    Field("silence_ms", "int", config.DEFAULT_SILENCE_MS, "Pause bis Turn-Ende (ms)",
+          "Höherer Wert lässt längere Sprechpausen zu, bevor der Turn abgeschlossen wird.",
           low=config.SILENCE_MS_RANGE[0], high=config.SILENCE_MS_RANGE[1],
           env=config.ENV_PREFIX + "SILENCE_MS"),
     Field("prefix_ms", "int", config.DEFAULT_PREFIX_MS, "Vorlauf (ms)",
-          "Wie viel Ton vor dem erkannten Sprechbeginn mitgeschnitten wird.",
+          "Verhindert abgeschnittene Satzanfänge.",
           low=config.PREFIX_MS_RANGE[0], high=config.PREFIX_MS_RANGE[1],
           env=config.ENV_PREFIX + "PREFIX_MS"),
-    Field("echo_cancellation", "bool", True, "Echo-Unterdrückung",
-          "Aus ist die häufigste Ursache dafür, dass sich das Modell selbst unterbricht.",
+    Field("echo_cancellation", "bool", True, "Echounterdrückung",
+          "Ohne sie hört die Session sich selbst.",
           env=config.ENV_PREFIX + "ECHO_CANCELLATION"),
     Field("noise_suppression", "bool", True, "Rauschunterdrückung", "",
           env=config.ENV_PREFIX + "NOISE_SUPPRESSION"),
     Field("auto_gain", "bool", True, "Automatische Verstärkung", "",
           env=config.ENV_PREFIX + "AUTO_GAIN"),
     Field("half_duplex", "bool", False, "Halbduplex",
-          "Mikrofon stumm, während das Modell spricht — für laute Lautsprecher.",
+          "Mikrofon stumm, während die Gegenseite spricht; für offene Lautsprecher.",
           env=config.ENV_PREFIX + "HALF_DUPLEX"),
+    Field("wake_provider", "enum", "auto", "Wake-Engine",
+          "Hermes liefert sherpa und porcupine mit; auto nimmt davon die vorhandene. "
+          "openwakeword nur, wenn es zusätzlich installiert wurde.",
+          choices=WAKE_PROVIDERS,
+          choice_labels={"auto": "automatisch (Hermes' Engine)",
+                         "sherpa": "sherpa",
+                         "openwakeword": "openwakeword",
+                         "porcupine": "porcupine"}),
+    Field("wake_word", "bool", False, "Mit „Hey Hermes“ starten",
+          "Verlangt, dass Hermes' eigenes Wake-Word aus ist; sonst hören zwei Detektoren "
+          "auf dasselbe Mikrofon. Der Knopf darunter schaltet es ab.",
+          env=config.ENV_PREFIX + "WAKE_WORD"),
     Field("extra_instructions", "text", "", "Zusätzliche Anweisung",
-          "Wird an die Systemanweisung angehängt.", env=config.ENV_PREFIX + "INSTRUCTIONS"),
+          "Wird dem Live-Modell mitgegeben.", env=config.ENV_PREFIX + "INSTRUCTIONS"),
 )
 
 BY_NAME = {spec.name: spec for spec in FIELDS}

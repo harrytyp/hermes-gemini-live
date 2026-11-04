@@ -6,7 +6,7 @@
 // Audio leaves this window as 16 kHz s16le frames over a sibling WebSocket; the Gemini
 // key is never sent here and never read here. The relay owns it.
 import { host, icons, resolveSiblingWsUrl } from '@hermes/plugin-sdk'
-import { createElement as h, useEffect, useState } from 'react'
+import { createElement as h, useEffect, useRef, useState } from 'react'
 
 const RELAY_PATH = '/api/plugins/hermes-gemini-live/relay'
 const SEND_RATE = 16000
@@ -349,6 +349,7 @@ async function loadStatus (rest) {
     // plugin disabled, which is a different fix from a missing key.
     call.status = { ok: false, detail: 'backend: ' + message(error) }
   }
+  const policy = (call.status && call.status.policy) || {}
   const devices = (call.status && call.status.devices) || {}
   call.tuning = {
     ...DEFAULT_TUNING,
@@ -516,6 +517,57 @@ function resumeWakeWord () {
   void host.request('wake.start', {}).catch(() => undefined)
 }
 
+/* "Hey Hermes" for this lane. The detection runs in the plugin's own process (it takes
+ * the microphone lease itself, see wake.py), so the core listener must be off — and the
+ * arm call is what enforces that, not a checkbox. A hit only stamps a timestamp; this
+ * renderer turns it into exactly one call and then tells the backend it consumed it.
+ */
+const WAKE_POLL_MS = 2000
+
+function useWakeWord (rest, enabled) {
+  const [notice, setNotice] = useState('')
+  const seenRef = useRef(0)
+  const busyRef = useRef(false)
+
+  useEffect(() => {
+    let live = true
+    if (!enabled) {
+      seenRef.current = 0
+      return () => { live = false }
+    }
+
+    const tick = async () => {
+      if (!live || busyRef.current || call.state !== 'idle') return
+      busyRef.current = true
+      try {
+        const payload = await rest('/status')
+        const state = (payload && payload.wake) || {}
+        const at = Number(state.pending) || 0
+        if (!seenRef.current) seenRef.current = at
+        if (at > seenRef.current) {
+          seenRef.current = at
+          busyRef.current = false
+          call.detail = ''
+          await start(rest)
+          return
+        }
+        if (state.armed === false && state.reason) setNotice(state.reason)
+      } catch {
+        /* a poll that fails is not a wake */
+      } finally {
+        busyRef.current = false
+      }
+    }
+    const timer = setInterval(() => void tick(), WAKE_POLL_MS)
+    return () => {
+      live = false
+      clearInterval(timer)
+    }
+  }, [enabled, rest])
+
+  return notice
+}
+
 const DELEGATION_TIMEOUT_MS = 180000
 const DELEGATION_POLL_MS = 1500
 
@@ -652,6 +704,8 @@ function TalkControl ({ rest }) {
   useCall()
   const status = call.status
   const blocked = !!(status && !status.ok)
+  const policy = (status && status.policy) || {}
+  const wakeNotice = useWakeWord(rest, Boolean(policy.wake_word) && call.state === 'idle')
 
   useEffect(() => {
     if (!status) void loadStatus(rest)
@@ -660,7 +714,7 @@ function TalkControl ({ rest }) {
   if (call.state === 'idle') {
     return h('button', {
       type: 'button',
-      title: call.detail || (blocked && status ? status.detail : 'Start a Gemini Live call'),
+      title: wakeNotice || call.detail || (blocked && status ? status.detail : 'Start a Gemini Live call'),
       'aria-label': 'Start Gemini Live call',
       disabled: blocked,
       onClick: () => void start(rest),
@@ -764,7 +818,8 @@ function FieldRow ({ field, value, onChange }) {
       className: CONTROL_CLASS,
       value: value == null ? field.default : value,
       onChange: event => onChange(event.target.value)
-    }, (field.choices || []).map(choice => h('option', { key: choice, value: choice }, choice)))
+    }, (field.choices || []).map(choice => h('option', { key: choice, value: choice },
+      (field.choice_labels && field.choice_labels[choice]) || choice)))
   } else if (field.kind === 'bool') {
     control = h('label', { className: 'inline-flex items-center gap-2 text-sm' },
       h('input', {
@@ -841,6 +896,36 @@ function DeviceRow ({ label, value, options, onChange }) {
     options.map(option => h('option', { key: option.id, value: option.id }, option.label))))
 }
 
+/* Hermes' own wake word and this plugin's cannot both listen: one microphone, two
+ * detectors, and whichever arms second loses the device. Rather than silently fighting,
+ * the switch refuses to go on while core is listening and offers the one action that
+ * unblocks it — core's own `wake.stop` plus the persisted config key, both reachable from
+ * here because the plugin speaks on the app's own connection.
+ */
+/* Asked of the plugin's own backend, not over ``wake.status``: that RPC reports the
+ * transport's view and stayed "enabled" after a refused config write, which is exactly the
+ * loop the user got stuck in (turn it off -> still blocked -> save does nothing). The
+ * backend reads the stored value fresh and asks the detector directly.
+ */
+async function coreWakeWord (rest) {
+  try {
+    const payload = await rest('/status')
+    const core = (payload && payload.wake && payload.wake.core) || {}
+    return { known: true, listening: Boolean(core.listening), enabled: Boolean(core.enabled) }
+  } catch {
+    return { known: false, listening: false, enabled: false }
+  }
+}
+
+async function switchCoreWakeWordOff (rest, draft) {
+  // Not a dedicated route: routes only exist once the plugin host reloads, so a new endpoint
+  // answers 404 until the app restarts — which is what this button did. Saving already has a
+  // route, and the backend settles the wake word as part of it: it stops Hermes' listener,
+  // persists the off state, verifies it, then arms this lane, and answers 409 with the reason
+  // if any step failed.
+  return rest('/settings', { method: 'PUT', body: { ...draft, wake_word: true } })
+}
+
 function money (value) {
   return '$' + (Math.round(value * 1000) / 1000).toFixed(3)
 }
@@ -871,10 +956,13 @@ function SettingsPage ({ rest }) {
   const [status, setStatus] = useState('loading')
   const [note, setNote] = useState('')
   const [usage, setUsage] = useState(null)
+  const [wakeState, setWakeState] = useState(null)
   const devices = useAudioDevices(status !== 'error')
 
   useEffect(() => {
     let live = true
+    rest('/status').then(payload => { if (live) setWakeState((payload && payload.wake) || null) })
+      .catch(() => undefined)
     rest('/settings').then(payload => {
       if (!live) return
       setFields(payload.fields || [])
@@ -895,13 +983,34 @@ function SettingsPage ({ rest }) {
   async function save () {
     setStatus('saving')
     setNote('')
+    if (draft.wake_word) {
+      const core = await coreWakeWord(rest)
+      if (core.enabled || core.listening) {
+        setStatus('ready')
+        setNote('Hermes hört noch selbst zu. Mach zuerst seine Ohren aus (Knopf unten), sonst hören zwei zu.')
+        setDraft(previous => ({ ...previous, wake_word: false }))
+        return
+      }
+    }
     try {
       const payload = await rest('/settings', { method: 'PUT', body: draft })
+      if ((payload.values || {}).wake_word) {
+        const armed = await rest('/wake/arm', { method: 'POST' }).catch(() => null)
+        if (armed && armed.armed === false) {
+          setNote(armed.reason || 'Wake-Word konnte nicht starten.')
+          setStatus('ready')
+          setValues(payload.values || {})
+          setDraft({ ...payload.values, wake_word: false })
+          return
+        }
+      } else {
+        void rest('/wake/disarm', { method: 'POST' }).catch(() => undefined)
+      }
       setValues(payload.values || {})
       setDraft(payload.values || {})
       setFields(payload.fields || fields)
       setStatus('ready')
-      setNote('Gespeichert. Gilt ab dem nächsten Anruf.')
+      setNote('Gemerkt. Gilt beim nächsten Anruf.')
     } catch (error) {
       setStatus('ready')
       setNote(message(error))
@@ -914,7 +1023,7 @@ function SettingsPage ({ rest }) {
     try {
       const payload = await rest('/reload', { method: 'POST' })
       setStatus('ready')
-      setNote('Module neu geladen (' + (payload.reloaded || []).length + '). Gilt ab dem nächsten Anruf.')
+      setNote('Fertig. Gilt beim nächsten Anruf.')
     } catch (error) {
       setStatus('ready')
       setNote(message(error))
@@ -968,6 +1077,51 @@ function SettingsPage ({ rest }) {
           onClick: () => setDraft({ ...values }),
           className: 'text-xs text-muted-foreground underline-offset-2 hover:underline'
         }, 'Verwerfen')
+        : null,
+      wakeState && wakeState.requirements && wakeState.requirements.deps_available === false
+        ? h('div', { className: 'grid gap-1 rounded-lg border border-(--ui-stroke-tertiary) p-3' },
+          h('div', { className: 'text-sm font-medium text-foreground' }, 'Wake-Engine fehlt'),
+          h('div', { className: 'text-xs text-muted-foreground' },
+            'Ohne die Engine kann „Hey Hermes“ nicht zuhören. Sie wird einmalig in die '
+            + 'Hermes-Umgebung installiert (ca. 7 MB).'),
+          h('button', {
+            type: 'button',
+            disabled: status === 'saving',
+            onClick: () => void (async () => {
+              setStatus('saving')
+              setNote('')
+              try {
+                const done = await rest('/settings', { method: 'PUT', body: { install_engine: true } })
+                setWakeState({ ...(wakeState || {}), requirements: { ...(wakeState.requirements || {}), deps_available: true } })
+                setStatus('ready')
+                setNote((done.installed && done.installed.detail) || 'Engine installiert.')
+              } catch (error) {
+                setStatus('ready')
+                setNote(message(error))
+              }
+            })(),
+            className: 'w-fit rounded-md border border-(--ui-stroke-tertiary) px-2 py-1 text-xs text-foreground hover:bg-(--ui-fill-secondary) disabled:opacity-40'
+          }, 'Engine installieren'))
+        : null,
+      draft.wake_word || values.wake_word
+        ? h('button', {
+          type: 'button',
+          title: 'Schaltet Hermes\' Wake-Word ab und diesen Anruf dafür ein',
+          onClick: () => void (async () => {
+            try {
+              const saved = await switchCoreWakeWordOff(rest, draft)
+              setValues(saved.values || { ...draft, wake_word: true })
+              setDraft(saved.values || { ...draft, wake_word: true })
+              setFields(saved.fields || fields)
+              setNote(saved.wake && saved.wake.stopped
+                ? 'Hermes\' Wake-Word ist aus; dieser Anruf hört auf „Hey Hermes“.'
+                : 'Hermes hörte bereits nicht zu; dieser Anruf hört auf „Hey Hermes“.')
+            } catch (error) {
+              setNote(message(error))
+            }
+          })(),
+          className: 'text-xs text-muted-foreground underline-offset-2 hover:underline'
+        }, 'Hermes\' Wake-Word ausschalten')
         : null,
       h('button', {
         type: 'button',
