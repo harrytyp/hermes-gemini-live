@@ -1,6 +1,6 @@
 # hermes-gemini-live
 
-[![tests](https://github.com/skappafrost/hermes-gemini-live/actions/workflows/tests.yml/badge.svg)](https://github.com/skappafrost/hermes-gemini-live/actions/workflows/tests.yml)
+[![tests](https://github.com/harrytyp/hermes-gemini-live/actions/workflows/tests.yml/badge.svg)](https://github.com/harrytyp/hermes-gemini-live/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Full-duplex **Gemini Live** voice inside [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s
@@ -10,6 +10,11 @@ Press the mic in the composer, speak, hear Gemini answer. Ask for something that
 a terminal, the web, or memory, and the voice model hands the job to Hermes over the api server,
 keeps the conversation going, and reads the outcome aloud when it lands. Several jobs can be in
 flight at once; when one stops because it needs *your* permission, the lane says so out loud.
+
+Around the call there is a page under **Settings → Plugins → Gemini Live**: how much of the
+conversation is written down, where a delegated task lands, how many run at once, which
+microphone and speaker, and — optionally — "Hey Hermes" to start talking without reaching for
+the mouse. The page wins over the environment variables of the same name.
 
 Your `GEMINI_API_KEY` stays server-side. This is not a preference: the Live API carries the key
 in the websocket URL, so handing it to a renderer would put a credential in a browser process.
@@ -30,10 +35,12 @@ Audio relays through Hermes' own backend, which holds the key.
 
 ## Install
 
-One command, into the Hermes home your shell points at:
+This is a fork of [skappafrost/hermes-gemini-live](https://github.com/skappafrost/hermes-gemini-live)
+that adds the settings page, the transcript, the usage ledger, delegation into the open chat and
+the wake word. One command, into the Hermes home your shell points at:
 
 ```bash
-hermes plugins install skappafrost/hermes-gemini-live
+hermes plugins install harrytyp/hermes-gemini-live
 ```
 
 It will say *"custom (unreviewed) source — not from the Hermes catalog"* until the catalog entry
@@ -94,12 +101,36 @@ delegated runs, its own `API_SERVER_KEY` (see [Troubleshooting](#troubleshooting
 | **Mute without hanging up** | Drops the microphone at the last step before the socket: session, context and running tasks stay alive, and you stop paying audio-in tokens. |
 | **Real work, delegated** | Three verbs, not thirty schemas: `hermes_task` starts a job, `hermes_tasks` reads the call's board, `hermes_task_update(task, action)` denies, steers or stops one of them (approving a parked run is a user button press, never a model call). |
 | **Survives your own clicking** | The call lives outside the React component's lifecycle, so opening a session or switching panes mid-sentence does not end it. |
+| **Delegation into the open chat** | The default target is the session you are looking at: the task becomes a voice turn there and the transcript adopts it, so the spoken part and the work are one conversation. `own_session` and `call_session` remain for the cases the api server allows. |
+| **A transcript that survives the call** | Turns are written into a session as they happen — delegations only, delegations plus utterances, or everything. A spoken call no longer leaves nothing behind in Recents. |
+| **Usage, numbered** | A local ledger of calls, minutes, tokens and an estimated cost from published rates. A number to compare, not a bill, and delegated Hermes work is never in it. |
+| **Wake word, optional** | "Hey Hermes" starts a call, using the engine Hermes already ships (sherpa, porcupine, or openwakeword when installed). Off by default; it requires Hermes' own wake word to be off, and the panel says so rather than fighting over the microphone. |
+| **One voice button** | An option hides Hermes' own composer voice control while this plugin provides the voice, so there is one mic instead of two. If the control cannot be found, it simply stays — two buttons, never none. |
 
 ## Configuration
 
-Every value is read from the environment of the profile serving the call. A variable that is
-**set but blank** is a refusal, never a silent fall-through. Put them next to the key in the
-same home's `.env`.
+Two layers, one order. The page under **Settings → Plugins → Gemini Live** writes
+`plugin-data/hermes-gemini-live/settings.json`; a value there wins over the environment variable
+of the same name. Everything else is read from the environment of the profile serving the call,
+and a variable that is **set but blank** is a refusal, never a silent fall-through.
+
+What the page offers:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `transcript_mode` | `delegations` | `delegations` writes the tasks, `utterances` adds what was said, `full` writes every turn |
+| `delegation_target` | `active_session` | `active_session` uses the chat you have open; `own_session` gives each task its own session; `call_session` keeps it in the call's session |
+| `include_voice_context` | on | Hands the delegated prompt the last spoken turns as context |
+| `concurrency` | `exclusive` | `exclusive` waits for the previous task; `parallel` runs up to four |
+| `long_call` | `auto_restart` | `keep`, `auto_restart`, or `hang_up` when the provider ends a long session |
+| `model_fallback` | on | Try another Live model when the chosen one stops answering |
+| `input_device` · `output_device` | system | `deviceId` constraint for the microphone and `setSinkId` for the speaker, both optional |
+| `take_over_button` | off | Hide Hermes' own composer voice control while this plugin is on |
+| `wake_word` | off | Listen for "Hey Hermes". Requires Hermes' own wake word to be off — the switch enforces it |
+| `wake_provider` | `auto` | `auto`, `sherpa`, `openwakeword` or `porcupine`; `auto` takes an engine that is actually importable |
+
+Anything the page does not list is still an environment variable, next to the key in the same
+home's `.env`:
 
 | Key | Default | What it does |
 |---|---|---|
@@ -127,6 +158,10 @@ same home's `.env`.
 | The model chats but never does the work | `gemini-3.8-live-extended-thinking` chooses to answer instead of delegating about 3 times in 5 — measured, not a wiring fault. | Use the default `gemini-3.8-live` |
 | Your speaker makes the model interrupt itself | Server-side sensitivity is **not adjustable** (`threshold`, `voiceActivityConfig`, `serverVad`, `pushToTalk` all close 1007). | Keep `GEMINI_LIVE_ECHO_CANCELLATION` on, or set `GEMINI_LIVE_HALF_DUPLEX=1` |
 | Edits to `desktop/plugin.js` do nothing | The app copies it at start-up. | Restart Hermes Desktop, then compare the two `plugin.js` mtimes |
+| The `wake_word` switch refuses to go on | Hermes' own listener holds the microphone lease; a second detector is what the refusal prevents. | Press **Hermes' Wake-Word ausschalten** on the same page — it stops the listener and persists the off state |
+| `Wake word could not start (… No module named 'pypinyin')` | sherpa's keyword spotter needs `pypinyin`, which Hermes' `[wake]` extra declares — an incomplete install leaves it out, and then no engine can listen. | `hermes pm install --extra wake`, or install `pypinyin==0.55.0`; the next save walks the engines again and takes the one that starts |
+| A newly added plugin route answers **404** while `/status` works | Plugin routes are registered when the host loads the plugin, so a route added to `dashboard/plugin_api.py` does not exist until the gateway restarts. `POST /reload` only re-imports `hermes_gemini_live.*`. | `hermes gateway restart`, then reload the Desktop plugins |
+| `unknown config key: wake_word.enabled` from `config.set` | That key has no setter; the RPC route cannot write it, and a silent refusal is what made the first version of the switch do nothing. | Nothing — the plugin writes it in-process through the same helper the core's own setters use |
 | `uv lock` complains about two workspace members named the same | Only affects plugins that declare `pyproject.toml`/`python_dependencies`. | Not this plugin — see [below](#why-there-is-no-pyprojecttoml) |
 
 ## Measured against the real endpoint
@@ -212,19 +247,38 @@ Rejected with close code **1007**: `threshold`, `voiceActivityConfig`, `serverVa
   handle is forwarded, but nothing resumes from it yet, so a new call starts empty.
 - **A delegated run is routed to `/p/<profile>/`** when the serving home is a named profile —
   an unprefixed run would resume in the *default* profile's memory.
-- Not supported: mobile/Discord capture, wake word (core's wake reaction is unconditional and
-  the microphone lease admits one owner — see below), appearing as a row in core's own voice
-  engine dropdown (that menu starts core's engines and offers no plugin seam), and memory
-  write-back from the panel.
+- Not supported: mobile/Discord capture, appearing as a row in core's own voice engine dropdown
+  (that menu starts core's engines and offers no plugin seam — hence the hide-the-other-button
+  option instead), and memory write-back from the panel.
 
-### Why wake word is not here
+### Wake word
 
-Hermes ships a real wake-word listener (`tools/wake_word.py`). It cannot be reused from a
-plugin lane for two reasons that are visible in core: `emitGatewayEvent` for `wake.detected`
-returns void and core then starts its own chained conversation unconditionally
-(`apps/desktop/src/app/contrib/wiring.tsx`), and the cross-process microphone lease
-(`runtime/wake-word.lock`) admits exactly one owner. A plugin that tried its own listener would
-either double-fire or be refused. Adding it properly is a core change, not a plugin one.
+Hermes' detector is one process-wide lease: `start_listening(on_wake, owner=…)` hands the
+microphone to exactly one owner and refuses everybody else with `WakeWordInUse`. It is also a
+file lock, so it holds across processes. That is not an obstacle to work around — it is the
+guarantee this plugin leans on.
+
+The plugin takes the same lease with its own owner object. Consequences, all deliberate:
+
+- While Hermes' own wake word holds the lease, arming is refused and the panel prints the reason.
+  The switch does not go on and pretend.
+- Turning the switch on is one save. The backend stops the other listener in-process
+  (`_teardown_locked`, which also releases the file lock), writes `wake_word.enabled: false`
+  through the same helper every core setter uses, reads it back, and only then arms.
+- A detection only stamps a timestamp. The renderer polls `/status` and starts exactly one call —
+  the detection stays on this lane instead of core's chained voice conversation, because core
+  never receives the event.
+- Engine choice is a setting. `auto` prefers an engine that is actually importable, not merely
+  supported on the platform, and arming walks the installed engines until one starts: sherpa
+  needs `pypinyin`, porcupine only knows its own keywords, openwakeword needs its extra. Nothing
+  is installed by the plugin; the panel offers an explicit **Engine installieren** only when
+  Hermes has no wake engine at all.
+
+Two honest edges. The switch is settled inside `PUT /settings` rather than on its own route,
+because plugin routes are registered when the host loads the plugin — a dedicated endpoint
+answers **404** in the running app, which is what a first attempt did. And if Hermes' listener
+lives in a different process than the plugin's backend, the config write still lands but the
+running detector cannot be closed from here; arming then fails with `WakeWordInUse` and says so.
 
 ## Why there is no `pyproject.toml`
 
@@ -252,9 +306,15 @@ hermes_gemini_live/
   agent_lane.py              # /v1/runs client, task board, worker pool, speakable text
   tools.py                   # the three function declarations
   relay.py                   # browser socket ⇄ Live socket, receipt-first tool handling
-dashboard/plugin_api.py      # GET /status, WS /relay — mounted at /api/plugins/<name>/
-desktop/plugin.js            # the composer control (uncompiled ESM, no JSX)
-tests/                       # 86 tests, no network
+  settings.py                # the page's schema, defaults, and the file that wins over env
+  transcript.py              # turns as they happen, per protocol depth
+  session_log.py             # writing into (and adopting) a session without a core change
+  wake.py                    # the microphone lease, engine choice, honest switch
+  models.py                  # ListModels catalog, filtered to bidiGenerateContent
+  usage.py                   # local ledger: calls, minutes, tokens, estimated cost
+dashboard/plugin_api.py      # /status, /settings, /models, /usage, /reload, WS /relay
+desktop/plugin.js            # the composer control and the settings page (uncompiled ESM, no JSX)
+tests/                       # 156 tests, no network
 ```
 
 Two rules that are easy to break by accident:
@@ -269,7 +329,7 @@ Two rules that are easy to break by accident:
 Run them with any Python that has `pytest`, `pytest-asyncio`, `httpx`, `starlette` and `fastapi`:
 
 ```bash
-python -m pytest -q   # 86 passed here; 2 of them need a Hermes checkout on PYTHONPATH
+python -m pytest -q   # 156 passed here; 2 of them need a Hermes checkout on PYTHONPATH
                       # and skip cleanly without one, which is what CI sees
 ```
 
@@ -279,10 +339,11 @@ making a call. CI cannot cover it, and this README does not claim it does.
 ## How this differs from other voice plugins
 
 The Hermes catalog already carries Gemini Live voice — notably **`gemini-live-bridge`**, which
-this README describes from its own catalog entry, not from a guess. It is the better pick if you
-want a *transcript-and-meters* experience: a status-bar minibar, model catalog, thinking level,
-session token meter and auto-redial through session resumption, and it is documented as having
-**no agent tools**.
+this README describes from its own catalog entry, not from a guess. It offers a status-bar
+minibar, a model catalog, thinking level, a session token meter and auto-redial through session
+resumption, and it is documented as having **no agent tools**. This plugin now writes transcripts
+and keeps a usage ledger of its own, so those are no longer a reason to pick one over the other;
+the difference is still the tools.
 
 This plugin's bet is the opposite: a single control in the composer, and the voice model being
 **able to make Hermes do things** — files, terminals, the web, memory — while the conversation
@@ -292,7 +353,7 @@ actually delegate (they do not all). Choose on that axis:
 
 | You want | Pick |
 |---|---|
-| Transcript, token meter, model picker, reconnect | `gemini-live-bridge` |
+| A minibar in the status bar rather than a composer control | `gemini-live-bridge` |
 | "Add this to the repo, then tell me what changed" by voice | this plugin |
 | Both | nothing stops you — they are separate sockets, but each holds a microphone, so run one at a time |
 
@@ -304,8 +365,10 @@ thing again: STT → agent → TTS turns, not a duplex model.
 `hermes plugins install hermes-gemini-live` needs a catalog entry merged into `hermes-agent` by a
 maintainer: a YAML pin under `plugin-catalog/` with a **full 40-character commit SHA**, no
 self-updating code, and declared capabilities matching what actually registers.
-`plugin-catalog/hermes-gemini-live.yaml` in this repo is that entry, ready to copy into a PR from
-the repository owner (rule 5 of the catalog's admission policy).
+`plugin-catalog/hermes-gemini-live.yaml` in this repo is that shape, but its `repo` and 40-character
+`sha` still point at the upstream commit this fork started from — re-pin both to this repository
+and to the commit you are proposing before copying it into a PR (rule 5 of the catalog's admission
+policy).
 
 ## License
 
