@@ -45,6 +45,22 @@ def _redactor(*secrets: str):
     return redact
 
 
+def _turn_mode_label(activity: dict | None) -> str:
+    """How this session decides a turn ended, for the one log line that reports it.
+
+    ``activity`` may be absent (manual turns) or carry ``automaticActivityDetection``
+    with or without a silence budget — reading the silence value unconditionally is what
+    turned a supported setup into a ``TypeError`` after the socket was already open.
+    """
+    detection = (activity or {}).get("automaticActivityDetection") or {}
+    if not detection:
+        return "manual turns"
+    if detection.get("disabled"):
+        return "manual turns"
+    silence = detection.get("silenceDurationMs")
+    return f"silence={silence}ms" if silence is not None else "auto turns"
+
+
 class LiveSession:
     """A thin async wrapper: connect, setup, append, receive.
 
@@ -60,7 +76,8 @@ class LiveSession:
 
     @classmethod
     async def open(cls, tools: list[dict] | None = None,
-                   handle: str | None = None) -> "LiveSession":
+                   handle: str | None = None,
+                   exclude: frozenset[str] | None = None) -> "LiveSession":
         """Open one session, with two adopted retries around the original single attempt.
 
         From gemini-live-bridge: a rejected resume handle is not a dead call — retry the
@@ -68,6 +85,10 @@ class LiveSession:
         either when another Live model is available. Both retries are bounded, and both
         are visible in the log, because silently switching the voice model mid-dial would
         be worse than the failure it hides.
+
+        ``exclude`` names models already proven silent on this call: a model that accepts a
+        setup and then ignores the microphone leaves nothing to catch, so the caller has to
+        be able to say "not that one again".
         """
         try:
             key = config.resolve_key()
@@ -80,13 +101,17 @@ class LiveSession:
             }
         except config.ConfigError as exc:
             raise LiveError(str(exc)) from exc
-        candidates = [model]
+        skip = exclude or frozenset()
+        candidates = [model] if model not in skip else []
         if config.model_fallback():
             try:
                 from . import models
-                candidates += [name for name in models.catalog()[:4] if name != model]
+                candidates += [name for name in models.catalog()[:4]
+                               if name != model and name not in skip]
             except Exception:
                 pass  # the chosen model alone is still a valid attempt
+        if not candidates:
+            raise LiveError("every Live model on this call has gone silent; hang up and redial")
         last: LiveError | None = None
         for candidate in candidates:
             plan = {**base, "model": candidate,
@@ -126,9 +151,9 @@ class LiveSession:
         except BaseException:
             await session.close()
             raise
-        logger.info("hermes-gemini-live: Live session open (%s%s, silence=%dms)",
+        logger.info("hermes-gemini-live: Live session open (%s%s, %s)",
                     plan["model"], " resuming" if handle else "",
-                    plan["activity"]["automaticActivityDetection"]["silenceDurationMs"])
+                    _turn_mode_label(plan.get("activity")))
         return session
 
     async def _await_setup(self) -> None:

@@ -23,23 +23,42 @@ logger = logging.getLogger(__name__)
 
 LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 CACHE_TTL_S = 600.0
-#: The order the panel shows when the key answers: the model the spike proved first, then
-#: its thinking variant, then the newest native-audio family, then anything else Live.
+#: What is known to work, most-tested first — measured against the live endpoint, three calls
+#: per model on 2026-11-24 with identical audio:
+#:
+#:     gemini-3.8-live                            1/3   (accepts the setup, ignores the mic)
+#:     gemini-3.8-live-extended-thinking           0/3
+#:     gemini-3.1-flash-live-preview               3/3
+#:     gemini-2.5-flash-native-audio-latest        3/3
+#:     gemini-2.5-flash-native-audio-preview-12-2025  3/3
+#:
+#: So the ranking is not "newest first" — it is "answers first", and the fallback chain now
+#: walks a model that metered 3/3 before one that metered 0/3. Rewrite this table only with
+#: fresh measurements; a guess here costs the user a silent call.
 _PROVEN = (config.DEFAULT_MODEL, config.DEFAULT_MODEL + "-extended-thinking")
+#: Tried in this order when the configured model goes deaf.
+_ANSWERED_3_OF_3 = (
+    "gemini-3.1-flash-live-preview",
+    "gemini-2.5-flash-native-audio-latest",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+)
 
 _cache: dict = {"at": 0.0, "key": "", "models": []}
 
 
 def _rank(name: str) -> tuple:
+    """Best first. A model that answers beats a model that merely exists."""
+    if name in _ANSWERED_3_OF_3:
+        return (0, _ANSWERED_3_OF_3.index(name))
     if name == _PROVEN[0]:
-        return (0, 0)
-    if name == _PROVEN[1]:
         return (1, 0)
-    if "native-audio-latest" in name:
+    if name == _PROVEN[1]:
         return (2, 0)
-    if "native-audio-preview" in name:
+    if "native-audio-latest" in name:
         return (3, 0)
-    return (4, 0)
+    if "native-audio-preview" in name:
+        return (4, 0)
+    return (5, 0)
 
 
 def _fetch(key: str) -> list[str]:

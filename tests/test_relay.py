@@ -94,9 +94,10 @@ def opened(monkeypatch):
 
         class Stub:
             @staticmethod
-            async def open(tools=None, handle=None):
+            async def open(tools=None, handle=None, exclude=None):
                 seen["tools"] = tools
                 seen["handle"] = handle
+                seen["exclude"] = exclude
                 return live
 
         monkeypatch.setattr(relay, "LiveSession", Stub)
@@ -168,7 +169,7 @@ async def test_a_refused_open_reports_why_and_leaves_no_session(monkeypatch):
 
     class Refusing:
         @staticmethod
-        async def open(tools=None, handle=None):
+        async def open(tools=None, handle=None, exclude=None):
             raise ConfigError("no Gemini key for Live: set GEMINI_LIVE_API_KEY or GEMINI_API_KEY")
 
     monkeypatch.setattr(relay, "LiveSession", Refusing)

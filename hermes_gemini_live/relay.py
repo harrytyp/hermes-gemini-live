@@ -12,6 +12,8 @@ same shape the voice domain learned a waiting tool is a dead microphone.
 from __future__ import annotations
 
 import asyncio
+import array
+import base64
 import json
 import logging
 import time
@@ -57,6 +59,17 @@ NEEDS_NOTE = (
 #: result into the middle of its own speech makes it stop the sentence it was saying and read
 #: the report instead, which is what the user heard as being cut off.
 QUIET_BEFORE_NOTE_S = 1.0
+
+#: What counts as the user actually speaking, on the 16-bit PCM the renderer sends. Silence
+#: with an open microphone produces frames too, so "frames arrived" alone proves nothing.
+SPEECH_PEAK = 0.02
+#: A Live model can accept a setup and then never answer the microphone — no error, no
+#: goodbye, just voice activity that never closes. Measured on gemini-3.8-live: 1 answer in 3
+#: calls, while gemini-3.1-flash-live-preview answered 3 of 3 with the same bytes. The wait
+#: is the user's own silence budget plus enough room for a model to think before answering.
+SILENT_MODEL_GRACE_S = 6.0
+#: Bounded, because walking every candidate on a call that cannot work is worse than saying so.
+MAX_MODEL_SWITCHES = 2
 
 
 @dataclass
@@ -167,6 +180,8 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
             if audio_frames == 1:
                 logger.info("hermes-gemini-live: first audio frame from the renderer (%d bytes b64)",
                             len(_b64(message)))
+            if _speech_peak(_b64(message)) >= SPEECH_PEAK:
+                note["heard_speech_at"] = time.monotonic()
             await live.send_audio(_b64(message))
         elif kind == "text":
             await live.send_text(_text(message))
@@ -468,6 +483,7 @@ async def _live_to_browser(browser: Any, live: LiveSession, note: dict,
                 frame["unpriced"] = ctx.usage.unpriced
             if kind == "audio":
                 notes.speaking()
+                note["model_answered"] = True
             if kind == "in_text":
                 ctx.transcript.add(transcript.USER, str(frame.get("text") or ""))
             elif kind == "out_text":
@@ -531,6 +547,28 @@ def _loads(message: str) -> dict:
     except ValueError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _speech_peak(b64: str) -> float:
+    """Loudest sample in a 16-bit PCM frame, 0..1. 0.0 for anything unreadable.
+
+    Used only to tell "the user said something" from "the microphone is open"; a frame that
+    cannot be decoded simply never counts as speech, so a malformed uplink can never make the
+    relay think it heard someone.
+    """
+    if not b64:
+        return 0.0
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception:
+        return 0.0
+    usable = len(raw) - (len(raw) % 2)
+    if usable < 2:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(raw[:usable])
+    peak = max((abs(value) for value in samples), default=0)
+    return peak / 32767.0
 
 
 def _frame_type(message: str) -> str:
@@ -619,9 +657,17 @@ async def _run_relay(browser: Any, session_key: str | None = None,
                               if ctx.log.session_id else None)
     tools = tools_module.declarations() if offer_tools else None
     attempt = 0
+    #: Models this call has already proven silent. A Live model that accepts a setup and then
+    #: ignores the microphone sends no error at all, so ``LiveSession.open``'s refusal retry
+    #: never fires — this set is what keeps it from being chosen again.
+    silent_models: set[str] = set()
+    #: Counted separately from ``silent_models``: a model whose name cannot be read would never
+    #: enter the set, and the loop would retry the same one forever.
+    switches = 0
     while True:
         try:
-            live = await LiveSession.open(tools, handle=note.get("handle") if attempt else None)
+            live = await LiveSession.open(tools, handle=note.get("handle") if attempt else None,
+                                          exclude=frozenset(silent_models))
         except (LiveError, ConfigError) as exc:
             logger.warning("hermes-gemini-live: call refused: %s", exc)
             await browser.send_text(_dump({"type": "error", "detail": str(exc)}))
@@ -631,6 +677,10 @@ async def _run_relay(browser: Any, session_key: str | None = None,
                                            "detail": lane_detail}))
         notes = NoteQueue(live)
         ctx.usage = usage_module.Usage(getattr(live, "model", "") or "")
+        # The watchdog's clock starts with this session, and only from a *fresh* one: a resumed
+        # socket inherits a conversation that was already heard.
+        note["session_opened_at"] = time.monotonic()
+        note["model_answered"] = False
         if attempt:
             await live.send_text("The connection was resumed. Say in one short sentence that "
                                  "you are back, then wait for the user.")
@@ -638,13 +688,35 @@ async def _run_relay(browser: Any, session_key: str | None = None,
                                                   profile, ctx, notes))
         down = asyncio.create_task(_live_to_browser(browser, live, note, book, session_key,
                                                     profile, notes, ctx))
+        #: Watches for the failure both pumps are blind to: an open session that never answers.
+        deaf = asyncio.create_task(_watch_for_a_deaf_model(live, note))
         try:
-            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait({up, down, deaf},
+                                               return_when=asyncio.FIRST_COMPLETED)
             for task in done:
+                if task is deaf:
+                    if note.get("switch_model"):
+                        note["reason"] = "the model heard nothing"
+                    continue
                 error = task.exception()
                 if not error:
                     continue
                 note["reason"] = str(error)
+                # A Live socket that fails on its own (1000/1006/1011) before the model said
+                # anything is the same defect as one that stays open and stays silent, and it
+                # has the same answer: another model. It surfaces on EITHER pump — the down pump
+                # when the server hangs up, the up pump when the next microphone chunk hits the
+                # closed socket — so the pump that raised must not decide this. A browser that
+                # navigated away raises WebSocketDisconnect, which is the user leaving, never a
+                # model fault. A call that already worked keeps the old behaviour: report it.
+                if (isinstance(error, LiveError) and not note.get("model_answered")
+                        and switches < MAX_MODEL_SWITCHES):
+                    note["switch_model"] = True
+                    note["reason"] = "the model closed the socket without answering"
+                    logger.warning("hermes-gemini-live: %s ended before answering (%s); "
+                                   "switching model", getattr(live, "model", "?"),
+                                   type(error).__name__)
+                    continue
                 if task is up:
                     # Which pump failed says who left. The browser pump only dies when the page
                     # goes away — a navigation, not a fault — and there is nobody to tell, so
@@ -665,7 +737,7 @@ async def _run_relay(browser: Any, session_key: str | None = None,
             # A pump that lost the race can finish with an exception nobody asked for — the
             # cancel lands after it already raised. Retrieving it here keeps asyncio from
             # printing a bare traceback that looks like a crash in the log.
-            for task in (up, down):
+            for task in (up, down, deaf):
                 if task.done() and not task.cancelled():
                     task.exception()
             await live.close()
@@ -687,6 +759,22 @@ async def _run_relay(browser: Any, session_key: str | None = None,
             note["restarted"] = True
             logger.info("hermes-gemini-live: session resumed on a fresh socket")
             continue
+        # A model that takes the setup and then ignores the microphone is not a dead call: the
+        # same audio answers on another Live model. Bounded, and it keeps the words that were
+        # said (the transcript and the board are this call's, not this socket's).
+        if note.pop("switch_model", False) and switches < MAX_MODEL_SWITCHES:
+            switches += 1
+            model_used = getattr(live, "model", "") or config.model()
+            silent_models.add(model_used)
+            note["reason"] = ""
+            note.pop("heard_speech_at", None)
+            # A resumption handle belongs to the model that minted it; carrying it across a
+            # switch would ask the new model to continue a conversation it never heard.
+            note.pop("handle", None)
+            attempt = 0
+            logger.info("hermes-gemini-live: retrying this call on another Live model (not %s)",
+                        model_used)
+            continue
         break
     if book.pending():
         logger.info("hermes-gemini-live: call ended with %d run(s) still going: %s",
@@ -694,6 +782,41 @@ async def _run_relay(browser: Any, session_key: str | None = None,
     logger.info("hermes-gemini-live: call ended (%s; %d audio frame(s) from the renderer)",
                 note["reason"] or "ended", note.get("audio_frames", 0))
 
+
+
+async def _watch_for_a_deaf_model(live: LiveSession, note: dict) -> None:
+    """Return when a *fresh* session kept the user's speech and never answered it.
+
+    A Live model can accept a setup, report voice activity and then produce nothing at all:
+    no error frame, no goodbye, no transcript. Measured on gemini-3.8-live (1 answer in 3)
+    against gemini-3.1-flash-live-preview (3 of 3) with identical bytes, so this is a provider
+    defect, not a settings mistake — and nothing else in the relay can see it, because both
+    pumps are healthy while it happens.
+
+    Never raises and never speaks: it only stamps ``switch_model`` for ``_run_relay``, which
+    owns the retry.
+    """
+    while True:
+        await asyncio.sleep(0.5)
+        opened = note.get("session_opened_at")
+        heard = note.get("heard_speech_at")
+        # ``is None``, not falsiness: both stamps are monotonic floats and a small one is a
+        # perfectly good stamp — ``not 0.0`` would silently disable the watchdog.
+        if note.get("model_answered") or opened is None or heard is None:
+            continue
+        if heard < opened:
+            # Speech that predates this session: a resumed socket, not a deaf model.
+            continue
+        budget = SILENT_MODEL_GRACE_S
+        try:
+            budget += config.silence_ms() / 1000.0
+        except Exception:
+            pass
+        if time.monotonic() - heard >= budget:
+            note["switch_model"] = True
+            logger.warning("hermes-gemini-live: %s heard the user and never answered "
+                           "(%.1fs); switching model", getattr(live, "model", "?"), budget)
+            return
 
 
 def _safe(error: BaseException) -> str:
