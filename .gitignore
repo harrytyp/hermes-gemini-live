@@ -7,3 +7,6 @@ __pycache__/
 
 # host install metadata, not source
 .hermes-catalog.json
+
+# local test venv (uv)
+.venvp/

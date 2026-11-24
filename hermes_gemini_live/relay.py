@@ -150,7 +150,8 @@ class NoteQueue:
 async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
                            book: agent_lane.RunBook | None = None,
                            session_key: str | None = None, profile: str | None = None,
-                           ctx: CallContext | None = None) -> None:
+                           ctx: CallContext | None = None,
+                           notes: NoteQueue | None = None) -> None:
     while True:
         message = await browser.receive_text()
         if len(message) > MAX_BROWSER_FRAME_BYTES:
@@ -171,8 +172,20 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
             sid = str(_loads(message).get("id") or "").strip()
             if sid and ctx.log.adopt(sid):
                 logger.info("hermes-gemini-live: transcript follows the open session %s", sid)
-        elif kind == "delegate_result" and ctx is not None:
-            await _delegate_finished(_loads(message), browser, book, notes)
+        elif kind == "delegate_result":
+            # A frame from the renderer is news, not control flow: one broken result must not
+            # end the call. The board is still right without a spoken receipt, so a failure
+            # here is logged and the pump keeps carrying audio.
+            value = _loads(message)
+            if book is None:
+                logger.info("hermes-gemini-live: task %s reported with no board; dropped",
+                            value.get("id"))
+            else:
+                try:
+                    await _delegate_finished(value, browser, book, notes)
+                except Exception as exc:
+                    logger.warning("hermes-gemini-live: could not report task %s (%s: %s)",
+                                   value.get("id"), type(exc).__name__, exc)
         elif kind == "close":
             note["reason"] = "browser closed the call"
             return
@@ -351,14 +364,22 @@ def _adopt_run_session(ctx: CallContext, run_id: str, browser: Any,
 
 
 async def _delegate_finished(value: dict, browser: Any, book: agent_lane.RunBook,
-                            notes: NoteQueue) -> None:
-    """The renderer finished (or gave up on) a task it submitted into the open chat."""
+                            notes: NoteQueue | None) -> None:
+    """The renderer finished (or gave up on) a task it submitted into the open chat.
+
+    ``notes`` may be absent: the board and the panel row are still correct without a spoken
+    receipt, and a call must not die over a missing announcement.
+    """
     task_id = str(value.get("id") or "").strip()
     state = str(value.get("state") or "unknown").strip() or "unknown"
     text = str(value.get("text") or "").strip()
     book.set_state(task_id, state, result=text)
-    notes.push(RESULT_NOTE.format(task_id=task_id, state=state, text=text or "no output"))
     await browser.send_text(_dump({"type": "task_done", "id": task_id, "state": state}))
+    if notes is None:
+        logger.info("hermes-gemini-live: task %s %s with no note queue; result unspoken",
+                    task_id, state)
+        return
+    notes.push(RESULT_NOTE.format(task_id=task_id, state=state, text=text or "no output"))
     await _release(notes, task_id, "finished")
 
 
@@ -605,7 +626,7 @@ async def _run_relay(browser: Any, session_key: str | None = None,
             await live.send_text("The connection was resumed. Say in one short sentence that "
                                  "you are back, then wait for the user.")
         up = asyncio.create_task(_browser_to_live(browser, live, note, book, session_key,
-                                                  profile, ctx))
+                                                  profile, ctx, notes))
         down = asyncio.create_task(_live_to_browser(browser, live, note, book, session_key,
                                                     profile, notes, ctx))
         try:

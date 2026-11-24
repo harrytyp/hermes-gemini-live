@@ -113,6 +113,45 @@ async def test_the_open_chat_is_adopted_for_the_transcript(tmp_path):
     assert ctx.log._buffer == [], "buffered speech must be flushed into the adopted chat"
 
 
+@pytest.mark.asyncio
+async def test_a_delegate_result_does_not_take_the_call_down():
+    """The regression that dropped every call a few seconds in.
+
+    The renderer's answer used to be handed to ``_delegate_finished`` with a ``notes`` name
+    that was never a parameter of ``_browser_to_live``. The NameError killed the browser
+    pump, and the relay reads a dead pump as the end of the call.
+    """
+    live = Live()
+    notes = relay.NoteQueue(live)
+    book = agent_lane.RunBook(None)
+    book.register("call_9", "Termin anlegen")
+    browser = Browser([json.dumps({"type": "delegate_result", "id": "call_9",
+                                   "state": "completed", "text": "Der Termin steht."}),
+                        json.dumps({"type": "close"})])
+
+    await relay._browser_to_live(browser, live, {"reason": ""}, book, None, None, _ctx(), notes)
+
+    assert book.pending() == []
+    assert len(live.notes) == 1, "the result has to be spoken, not silently dropped"
+    assert "Der Termin steht." in live.notes[0]
+    assert {"type": "task_done", "id": "call_9", "state": "completed"} in browser.sent
+
+
+@pytest.mark.asyncio
+async def test_a_delegate_result_without_a_note_queue_still_lands_on_the_board():
+    """A harness may pump the browser without a NoteQueue; the call must survive that too."""
+    book = agent_lane.RunBook(None)
+    book.register("call_9", "Termin anlegen")
+    browser = Browser([json.dumps({"type": "delegate_result", "id": "call_9",
+                                   "state": "completed", "text": "Der Termin steht."}),
+                        json.dumps({"type": "close"})])
+
+    await relay._browser_to_live(browser, Live(), {"reason": ""}, book, None, None, _ctx())
+
+    assert book.pending() == []
+    assert {"type": "task_done", "id": "call_9", "state": "completed"} in browser.sent
+
+
 def test_the_frame_vocabulary_accepts_the_renderer_frames():
     assert relay._frame_type(json.dumps({"type": "delegate_result", "id": "x"})) == "delegate_result"
     assert relay._frame_type(json.dumps({"type": "delegate_result"})) == ""
