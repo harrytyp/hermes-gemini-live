@@ -180,7 +180,10 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
             if audio_frames == 1:
                 logger.info("hermes-gemini-live: first audio frame from the renderer (%d bytes b64)",
                             len(_b64(message)))
-            if _speech_peak(_b64(message)) >= SPEECH_PEAK:
+            if "heard_speech_at" not in note and _speech_peak(_b64(message)) >= SPEECH_PEAK:
+                # First words of this session. Deliberately not "the latest speech": a user
+                # who keeps talking into a model that never answers is the very case this
+                # watchdog exists for, and a moving stamp would postpone it forever.
                 note["heard_speech_at"] = time.monotonic()
             await live.send_audio(_b64(message))
         elif kind == "text":
