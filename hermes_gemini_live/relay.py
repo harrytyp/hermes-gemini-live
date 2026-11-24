@@ -152,12 +152,21 @@ async def _browser_to_live(browser: Any, live: LiveSession, note: dict,
                            session_key: str | None = None, profile: str | None = None,
                            ctx: CallContext | None = None,
                            notes: NoteQueue | None = None) -> None:
+    #: Audio frames the renderer actually sent on this call. Logged at the end: "the model
+    #: never answered" has exactly two causes, a dead provider or a silent uplink, and this
+    #: counter is what tells them apart without a microphone and a user.
+    audio_frames = 0
     while True:
         message = await browser.receive_text()
         if len(message) > MAX_BROWSER_FRAME_BYTES:
             continue
         kind = _frame_type(message)
         if kind == "audio":
+            audio_frames += 1
+            note["audio_frames"] = audio_frames
+            if audio_frames == 1:
+                logger.info("hermes-gemini-live: first audio frame from the renderer (%d bytes b64)",
+                            len(_b64(message)))
             await live.send_audio(_b64(message))
         elif kind == "text":
             await live.send_text(_text(message))
@@ -682,7 +691,8 @@ async def _run_relay(browser: Any, session_key: str | None = None,
     if book.pending():
         logger.info("hermes-gemini-live: call ended with %d run(s) still going: %s",
                     len(book.pending()), ",".join(book.pending()))
-    logger.info("hermes-gemini-live: call ended (%s)", note["reason"] or "ended")
+    logger.info("hermes-gemini-live: call ended (%s; %d audio frame(s) from the renderer)",
+                note["reason"] or "ended", note.get("audio_frames", 0))
 
 
 
