@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "hermes-gemini-live"
 
-#: Wire-supported Live model ids the panel may offer. Kept to what the spike actually
-#: measured: a third id offered from memory would be a guess the panel makes for the user.
+#: Only a seed for the dropdown, used when the key cannot be asked at all. The live list is
+#: ``models.choices()`` — the ids this key reports right now — so a model Google ships or
+#: retires tomorrow needs no edit here.
 MODEL_CHOICES = (config.DEFAULT_MODEL, config.DEFAULT_MODEL + "-extended-thinking")
 
 WAKE_PROVIDERS = ("auto", "sherpa", "openwakeword", "porcupine")
@@ -224,10 +225,24 @@ def _coerce(spec: Field, value: Any) -> Any:
         if len(text) > spec.max_len:
             raise SettingsError(f"{spec.label}: höchstens {spec.max_len} Zeichen")
         return text
-    if not isinstance(value, str) or value.strip() not in spec.choices:
-        raise SettingsError(f"{spec.label}: '{value}' ist nicht "
-                            f"{', '.join(spec.choices)}")
-    return value.strip()
+    if not isinstance(value, str) or not value.strip():
+        raise SettingsError(f"{spec.label}: erwartet einen Wert")
+    text = value.strip()
+    # Only the model field is an open list: Google adds and retires Live models, and the
+    # catalog it is checked against is the API's answer at the time the panel loaded. Every
+    # other enum (voice, transcript depth, …) stays a closed set — those are wire constants,
+    # and validating the voice against model ids is exactly the bug this comment prevents.
+    allowed = spec.choices
+    if spec.name == "model":
+        try:
+            from . import models
+            allowed = models.choices() or spec.choices
+        except Exception:
+            pass  # keep the seed list rather than refusing a save the key cannot be asked about
+    if allowed and text not in allowed:
+        raise SettingsError(f"{spec.label}: '{text}' ist nicht "
+                            f"{', '.join(allowed)}")
+    return text
 
 
 def _from_env(spec: Field) -> Any:

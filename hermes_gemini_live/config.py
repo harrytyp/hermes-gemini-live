@@ -11,10 +11,15 @@ import os
 ENV_PREFIX = "GEMINI_LIVE_"
 
 #: Proven against the live endpoint by the spike: setup accepted, audio returned at
-#: audio/pcm;rate=24000. ``...-extended-thinking`` additionally REQUIRES a thinking level
-#: ("Thinking level must be specified for this model") and accepts high|low — but hands work
-#: to Hermes in only 2 of 5 turns against this model's 8 of 8, which is the difference
-#: between a voice lane that acts and one that narrates. See the README table.
+#: audio/pcm;rate=24000. A ``...-extended-thinking`` variant additionally REQUIRES a thinking
+#: level ("Thinking level must be specified for this model") and accepts high|low, which
+#: ``models.needs_thinking_level`` decides from the id — the default model refuses that field
+#: outright ("Thinking level is not supported"), so it is not something to send optimistically.
+#: The **first choice only**, replaced by the catalog as soon as the key answers: the
+#: dropdown and the fallback chain read ``models.voice_models()``, which is ordered by what
+#: Google currently reports (conversational first, released before preview, newest version
+#: before older). This constant exists so a first run with no network still has a dialable
+#: id, and so the settings default is not "nothing".
 DEFAULT_MODEL = "gemini-3.8-live"
 THINKING_LEVELS = ("high", "low")
 DEFAULT_THINKING_LEVEL = "high"
@@ -210,7 +215,8 @@ def thinking_level(model_id: str) -> str | None:
     with ``thinkingBudget: -1``, which is the same number — and it already spends ~940 thought
     tokens per turn on its own. So None for this model is its maximum, not an omission.
     """
-    if "extended-thinking" not in model_id:
+    from . import models as models_module
+    if not models_module.needs_thinking_level(model_id):
         return None
     stored = _setting("thinking_level")
     if stored:

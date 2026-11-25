@@ -105,9 +105,11 @@ class LiveSession:
         candidates = [model] if model not in skip else []
         if config.model_fallback():
             try:
-                from . import models
-                candidates += [name for name in models.catalog()[:4]
-                               if name != model and name not in skip]
+                from . import models as models_module
+                # The catalog decides, not a list here: a model Google publishes tomorrow is
+                # trialled without a release of this plugin.
+                candidates += [name for name in models_module.fallback_order(model)
+                               if name not in skip]
             except Exception:
                 pass  # the chosen model alone is still a valid attempt
         if not candidates:
