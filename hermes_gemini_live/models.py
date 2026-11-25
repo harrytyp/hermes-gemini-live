@@ -118,12 +118,13 @@ def _fetch(key: str) -> list[str]:
     names: list[str] = []
     for model in payload.get("models", []):
         raw = str(model.get("name") or "")
-        lowered = raw.lower()
-        # The capability filter is the API's own answer, not a guess from the name: only a
-        # model that speaks the Live protocol can be opened as a session at all.
+        # The ONLY hard filter is the API's own answer: bidiGenerateContent is the protocol this
+        # lane speaks, and Google publishes it as machine-readable metadata. Deliberately no
+        # extra "must contain 'live'" test — that is a guess about naming, and it silently drops
+        # a real model the day a family is called something else (a hypothetical
+        # ``gemini-4-pro-realtime`` would vanish). Whether the model is *usable* as a voice
+        # assistant is then a family question, answered by :func:`is_conversational`.
         if "bidiGenerateContent" not in (model.get("supportedGenerationMethods") or []):
-            continue
-        if "live" not in lowered and "native-audio" not in lowered:
             continue
         names.append(raw.split("/", 1)[1] if raw.startswith("models/") else raw)
     return names

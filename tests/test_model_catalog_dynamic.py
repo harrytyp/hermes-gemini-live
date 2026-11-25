@@ -84,3 +84,58 @@ def test_the_fallback_order_comes_from_the_catalog_not_a_list(monkeypatch):
 ])
 def test_version_key(name, expected):
     assert models._version(name) == expected
+
+
+def test_a_live_model_called_something_else_is_still_found(monkeypatch):
+    """The catalog must not require the word "live" in the id.
+
+    A future family can be named "realtime" or anything else; the only reliable signal is the
+    protocol the API says the model speaks. Requiring "live" in the name would silently drop
+    a real model the day that happens.
+    """
+    payload = {"models": [
+        {"name": "models/gemini-4-pro-realtime",
+         "supportedGenerationMethods": ["bidiGenerateContent", "countTokens"]},
+        {"name": "models/gemini-4-pro",                       # not a Live model at all
+         "supportedGenerationMethods": ["generateContent"]},
+    ]}
+
+    class FakeResponse:
+        def read(self):
+            import json
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(models.urllib.request, "urlopen", lambda *a, **kw: FakeResponse())
+    assert models._fetch("key") == ["gemini-4-pro-realtime"]
+    assert models.is_conversational("gemini-4-pro-realtime")
+
+
+def test_the_catalog_carries_every_live_capable_model_not_a_subset(monkeypatch):
+    payload = {"models": [
+        {"name": "models/gemini-4.2-live", "supportedGenerationMethods": ["bidiGenerateContent"]},
+        {"name": "models/genie-5", "supportedGenerationMethods": ["bidiGenerateContent"]},
+        {"name": "models/gemini-4-tts-live", "supportedGenerationMethods": ["bidiGenerateContent"]},
+    ]}
+
+    class FakeResponse:
+        def read(self):
+            import json
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(models.urllib.request, "urlopen", lambda *a, **kw: FakeResponse())
+    names = models._fetch("key")
+    assert names == ["gemini-4.2-live", "genie-5", "gemini-4-tts-live"]
+    # The catalog keeps them (they ARE Live); only the voice lane filters.
+    assert [n for n in names if models.is_conversational(n)] == ["gemini-4.2-live"]
